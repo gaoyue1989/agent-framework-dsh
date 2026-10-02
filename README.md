@@ -87,11 +87,21 @@ make run                     # 启动（需 LLM_* / CHECKPOINT_*，见 scripts/b
 ## release-agent 切换验证（2026-10-02，已切换）
 
 `oaf-release-agent`（智能发布助手）已切换为 dsh 运行时：`packages/oaf-loader` 实现 OAF 包最小加载
-（AGENTS.md frontmatter → 系统提示词段；`mcp-configs/*` → `dsh-mcp-client` 桥；部署清单
-[manifests/oaf-release-agent-dsh.yaml](manifests/oaf-release-agent-dsh.yaml)，同 OAF 包 PVC subPath、
-同 env CM+Secret、独立 checkpoint 库）。**切换方式**：`oaf-release-agent-svc` selector 增加
-`runtime: dsh`（Java Deployment 原样保留，回滚 = `kubectl patch svc oaf-release-agent-svc -p
-'{"spec":{"selector":{"app.kubernetes.io/name":"oaf-release-agent"}}}'`）。
+（AGENTS.md frontmatter → 系统提示词段；`mcp-configs/*` → `dsh-mcp-client` 桥）。
+
+**切换方式（平台原生路径，最终形态）**：dsh 镜像推入本地 registry（`172.20.0.1:5001/agent-framework-dsh:m0`）
+→ platform-backend `AVAILABLE_IMAGES` 白名单加项 → **平台 API republish 换镜像**（`POST
+/api/v1/services/:id/republish`，env 指向 dsh 独占 checkpoint 库 `agent_framework_dsh`）→
+服务列表镜像字段、A2A 注册（agent-card 端点已补，注册成功 Release Agent@1.1.0）、状态机全部
+走平台原生路径——页面显示与「重新发布」行为一致。早期 selector 影子切换方案已废弃撤除。
+
+**切换操作的两条纪律（踩坑记录）**：
+- `PATCH /services/:id/env` 是**全量覆盖**语义——必须传完整键集，只传变更键会清掉其余键
+  （envFrom CM 被重写、Pod 起不来）；republish 的 `env` 参数同理为非敏感键全量替换（敏感键
+  sticky 保留）。
+- **Java 与 dsh 不可共用同一 checkpoint 库**：Java Flyway 的 V6 迁移会与 dsh 建的表冲突
+  （validate failed 拒绝启动）。dsh 独占 `agent_framework_dsh`；回滚 Java 时 env 的
+  CHECKPOINT_JDBC_URL 需一并指回 `oaf_checkpoint`。
 
 **与 Java 运行时一致（实测对照）**：/health 契约字段与取值（agent/slug/version 读包 frontmatter，
 version=1.1.0 双侧一致）、OAF 人设行为（自我介绍/确认工作流约束同样生效）、platform-publisher
@@ -102,12 +112,24 @@ durable SSE 续传、Ingress 全链路（宿主 nginx → /agent/release-agent �
 **已知差距（M1–M3 补齐，切换前必读）**：
 - **HITL 语义差异**：Java 对 ask 工具（publish/update_env/republish/unpublish/delete）发
   `permission_ask` 挂起等待确认卡；dsh M0 无确认桥，经 `tools/pre-execute` 安全降级为 **deny**
-  （确定性验证 `make test-ask-deny` 4 断言：拦截为 ERROR + 拒绝原因 + 工具体不执行）。**变更类
-  操作在 dsh 实例上当前会被拒绝**，需在 Java 实例（或 M2 hitl-bridge 上线后）完成。
+  （确定性验证 `make test-ask-deny` 4 断言：拦截为 ERROR + 拒绝原因 + 工具体不执行）。**对话内
+  变更类操作在 dsh 实例上当前会被拒绝**；平台页面的 republish/下线等管理操作由 backend 直接
+  执行、不经过 agent 工具，不受此限制。
 - 工具命名：dsh 向 LLM 暴露 `mcp__{server}__{tool}` 全名（AF 为裸名）——对模型行为无实质影响，
   与 `/tools` 展示契约的差异在 M1 对齐。
 - 合成帧（`tool_call_summary`/`tool_result_preview`）、`/tools`、`/skills`、`/mcp`、`/models`、
-  `/metadata`、agent-card、`/admin/reload`、fileIds 上传、A2A/Agent Protocol、OTel/审计未实现。
+  `/metadata`、fileIds 上传、A2A JSON-RPC（`/` POST；agent-card 已有）、Agent Protocol、
+  OTel/审计未实现。
+
+**回滚**（经平台 API，两条命令）：
+```bash
+# republish 换回 Java 镜像；CHECKPOINT_JDBC_URL 一并指回 oaf_checkpoint（Java/dsh 不可共库）
+# env 为非敏感键全量替换——传完整 7 键（CHECKPOINT_JDBC_URL/CHECKPOINT_USERNAME/
+#   FILE_EXTERNAL_URL_PREFIXES/LLM_BASE_URL/LLM_MODEL_ID/OPENSANDBOX_SERVER_URL/SANDBOX_ENABLED）
+curl -X POST http://<platform-backend>/api/v1/services/27/republish -H 'Content-Type: application/json' \
+  -d '{"image":"172.20.0.1:5001/agent-framework:agentscope-2.1.0-v20260928","env":{"CHECKPOINT_JDBC_URL":"jdbc:mysql://oaf-mysql.agent-platform.svc.cluster.local:3306/oaf_checkpoint?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC","...":"...其余 6 键同切换前"}}'
+# 若状态停在 register_failed：POST /api/v1/services/27/register 手动重注册
+```
 
 ## 部署与 e2e（三种运行时驱动，2026-10-02 全部验证 24/24）
 
