@@ -5,6 +5,8 @@ set -e
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 AF="${AF_E2E_ROOT:-$(cd "$ROOT/.." && pwd)/agent-framework/e2e}"
 [ -d "$AF" ] || { echo "需要 agent-framework 仓库同层克隆（$AF）"; exit 1; }
+# AF e2e 依赖自举（playwright 等；CI 场景主仓为全新 checkout）
+[ -d "$AF/node_modules/@playwright/test" ] || (cd "$AF" && npm ci --no-audit --no-fund >/dev/null 2>&1 || npm install --no-audit --no-fund >/dev/null 2>&1)
 BENCH_MCP_PORT=18082 APPROVAL_MCP_PORT=8813 MOCK_LLM_PORT=18081
 cleanup() { for f in /tmp/af-e2e-*.pid; do kill -9 "$(cat $f)" 2>/dev/null; rm -f $f; done; [ -n "$RT" ] && kill -9 $RT 2>/dev/null; }
 trap cleanup EXIT
