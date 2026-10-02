@@ -75,17 +75,19 @@ test('活流工具调用：首个 tool-call-delta 发 TOOL_CALL_START，block-en
   assert.equal(frames[3].toolCallName, 'echo');
 });
 
-test('结算 tool/call 在活流已发 START 时只兜底一次 END；无活流时 START+END 成对', () => {
-  // 路径 A：活流已发 START（块收口也发了 END）→ 结算事件零帧
+test('结算 tool/call 恒发 tool_call_summary（每调用一次）；活流路径补 END 兜底', () => {
+  // 路径 A：活流已发 START（块收口也发了 END）→ 结算事件只补摘要帧
   const s1 = serializer();
-  liveStreamFrames(s1, { type: 'chunk', chunk: { type: 'tool-call-delta', index: 0, id: 'c1', name: 'echo', argumentsDelta: '{}' } });
+  liveStreamFrames(s1, { type: 'chunk', chunk: { type: 'tool-call-delta', index: 0, id: 'c1', name: 'echo', argumentsDelta: '{"text":"端到端回显内容"}' } });
   liveStreamFrames(s1, { type: 'chunk', chunk: { type: 'block-end', index: 0, block: {} } });
-  assert.deepEqual(settledEventFrames(s1, { type: 'tool/call', seq: 0, time: 0, data: { callId: 'c1', name: 'echo', arguments: '{}' } }), []);
+  const a = settledEventFrames(s1, { type: 'tool/call', seq: 0, time: 0, data: { callId: 'c1', name: 'echo', arguments: '{"text":"端到端回显内容"}' } });
+  assertTypes(a, ['tool_call_summary']);
+  assert.equal(a[0].summary, 'echo 端到端回显内容');
 
-  // 路径 B：无活流（冷恢复）→ 结算兜底 START+END
+  // 路径 B：无活流（冷恢复）→ 结算兜底 START+END+摘要
   const s2 = serializer();
   const frames = settledEventFrames(s2, { type: 'tool/call', seq: 0, time: 0, data: { callId: 'c2', name: 'write_file', arguments: '{"p":1}' } });
-  assertTypes(frames, ['TOOL_CALL_START', 'TOOL_CALL_END']);
+  assertTypes(frames, ['TOOL_CALL_START', 'TOOL_CALL_END', 'tool_call_summary']);
   assert.equal(frames[0].toolName, 'write_file');
 });
 
@@ -96,9 +98,10 @@ test('结算 tool/result → TOOL_RESULT_START/TEXT_DELTA/END（isError → ERRO
     type: 'tool/result', seq: 0, time: 0,
     data: { message: { role: 'tool', toolCallId: 'c1', content: [{ type: 'text', text: 'done' }] } },
   });
-  assertTypes(ok, ['TOOL_RESULT_START', 'TOOL_RESULT_TEXT_DELTA', 'TOOL_RESULT_END']);
+  assertTypes(ok, ['TOOL_RESULT_START', 'TOOL_RESULT_TEXT_DELTA', 'TOOL_RESULT_END', 'tool_result_preview']);
   assert.equal(ok[2].state, 'SUCCESS');
   assert.equal(ok[1].delta, 'done');
+  assert.equal(ok[3].preview, 'done');
 
   const bad = settledEventFrames(s, {
     type: 'tool/result', seq: 0, time: 0,
@@ -121,6 +124,18 @@ test('turn/end → AGENT_END；非映射事件（user/message 等）零帧', () 
   assertTypes(settledEventFrames(s, { type: 'turn/end', seq: 0, time: 0, data: { turn: 1, reason: { kind: 'completed' } } }), ['AGENT_END']);
   assert.deepEqual(settledEventFrames(s, { type: 'user/message', seq: 0, time: 0, data: {} }), []);
   assert.deepEqual(settledEventFrames(s, { type: 'request/header', seq: 0, time: 0, data: {} }), []);
+});
+
+test('HITL 恢复段：resumeSummaries 命中时 RESULT_END 前补「执行 X」兜底摘要', () => {
+  const s = serializer();
+  s.resumeSummaries.add('call-9');
+  const frames = settledEventFrames(s, {
+    type: 'tool/result', seq: 0, time: 0,
+    data: { message: { role: 'tool', toolCallId: 'call-9', content: [{ type: 'text', text: 'ok' }] } },
+  });
+  assertTypes(frames, ['TOOL_RESULT_START', 'tool_call_summary', 'TOOL_RESULT_TEXT_DELTA', 'TOOL_RESULT_END', 'tool_result_preview']);
+  assert.equal(frames[1].summary, '执行 tool');
+  assert.ok(frames.indexOf(frames[1]) < frames.findIndex((f) => f.type === 'TOOL_RESULT_END'), '摘要须在 RESULT_END 之前');
 });
 
 test('控制帧形状（§9.9：无 id、session_id/waiting/done/error）', () => {
@@ -158,5 +173,24 @@ test('A.1 完整时序快照：普通对话（无工具）帧类型序列与 AF 
     'TEXT_BLOCK_END',
     'MODEL_CALL_END',
     'AGENT_END',
+  ]);
+});
+
+test('工具调用完整时序快照：结算 tool/call → 摘要；tool/result → 预览（S4/H2 契约）', () => {
+  const s = serializer();
+  const types = [];
+  const push = (frames) => types.push(...frames.map((f) => f.type));
+
+  push(settledEventFrames(s, { type: 'tool/call', seq: 1, time: 0, data: { callId: 'c1', name: 'echo', arguments: '{"text":"hi"}' } }));
+  push(settledEventFrames(s, { type: 'tool/result', seq: 2, time: 0, data: { message: { role: 'tool', toolCallId: 'c1', content: [{ type: 'text', text: 'echo: hi' }] } } }));
+
+  assert.deepEqual(types, [
+    'TOOL_CALL_START',
+    'TOOL_CALL_END',
+    'tool_call_summary',
+    'TOOL_RESULT_START',
+    'TOOL_RESULT_TEXT_DELTA',
+    'TOOL_RESULT_END',
+    'tool_result_preview',
   ]);
 });
