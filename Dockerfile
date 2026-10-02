@@ -19,6 +19,7 @@ COPY packages/oaf-common/package.json packages/oaf-common/
 COPY packages/oaf-server/package.json packages/oaf-server/
 COPY packages/oaf-mysql-persistence/package.json packages/oaf-mysql-persistence/
 COPY packages/oaf-loader/package.json packages/oaf-loader/
+COPY packages/oaf-tools/package.json packages/oaf-tools/
 COPY profiles/oaf-web/package.json profiles/oaf-web/
 RUN pnpm install --frozen-lockfile || pnpm install
 COPY packages/ packages/

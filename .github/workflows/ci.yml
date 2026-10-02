@@ -1,0 +1,72 @@
+name: agent-framework-dsh-ci
+
+on:
+  push:
+    branches: [master]
+    paths: ['**']
+  pull_request:
+    branches: [master]
+
+# 同工作流内同分支互斥（跨工作流互不取消，对齐主仓约定）
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: e2e-root
+          MYSQL_DATABASE: agent_framework_dsh
+          MYSQL_USER: e2e
+          MYSQL_PASSWORD: e2e-pass
+        ports: ['3306:3306']
+        options: >-
+          --health-cmd "mysqladmin ping -h localhost"
+          --health-interval 10s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: gaoyue1989/agent-manager       # e2e 依赖主仓 mock 基建
+          path: agent-manager
+      - uses: actions/checkout@v4
+        with:
+          path: agent-framework-dsh
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: agent-framework-dsh/pnpm-lock.yaml
+      - name: 安装依赖 + dsh-home 自举
+        working-directory: agent-framework-dsh
+        run: make install
+      - name: 单元测试（帧序列化快照）
+        working-directory: agent-framework-dsh
+        run: make test
+      - name: M0 冒烟 e2e（三驱动之 spawn：24 断言 + 冷恢复）
+        working-directory: agent-framework-dsh
+        env:
+          AF_E2E_DIR: ${{ github.workspace }}/agent-manager/agent-framework/e2e
+          CHECKPOINT_JDBC_URL: jdbc:mysql://127.0.0.1:3306/agent_framework_dsh
+          CHECKPOINT_USERNAME: e2e
+          CHECKPOINT_PASSWORD: e2e-pass
+        run: make smoke
+      - name: AF 门禁套件 S/F/H 组（api-core 对 dsh 实跑）
+        working-directory: agent-framework-dsh
+        env:
+          AF_E2E_ROOT: ${{ github.workspace }}/agent-manager/agent-framework/e2e
+          CHECKPOINT_JDBC_URL: jdbc:mysql://127.0.0.1:3306/agent_framework_dsh
+          CHECKPOINT_USERNAME: e2e
+          CHECKPOINT_PASSWORD: e2e-pass
+        run: bash e2e/run-af-e2e.sh --grep "S1|S2|S3|S4|S6|S7|S8|S9|F1|F4|F6|F7|F8|F12|H1|H2|H3|H4|H5|H6|H8" --reporter=line
+      - name: ask 工具安全降级确定性验证
+        working-directory: agent-framework-dsh
+        env:
+          AF_E2E_DIR: ${{ github.workspace }}/agent-manager/agent-framework/e2e
+        run: make test-ask-deny

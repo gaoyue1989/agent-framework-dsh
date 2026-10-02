@@ -87,19 +87,19 @@ make run                     # 启动（需 LLM_* / CHECKPOINT_*，见 scripts/b
 ## e2e 门禁实况（AF playwright api-core，2026-10-02）
 
 以 agent-framework 同一套 e2e 套件（`agent-framework/e2e/tests/api-core.spec.ts`，51 用例）对 dsh 运行时实跑：
-**32 通过 / 18 红 / 1 skip**。分组实况：
+**37 通过 / 13 红 / 1 skip**。分组实况：
 
 | 组 | 结果 | 红项与归属 |
 |---|---|---|
-| S 基础 | **7/8** | S5 userHeaders per-call 注入（MCP 多租户按用户调用，M2） |
-| F 文件 | **6/7** | F2 图片视觉内联（dsh attachment 管线，M1） |
-| H HITL | **7/7 全绿** | ——（approval 接缝桥接：ask 挂起/confirm-stream/同步 confirm/409/ASKING 态/denied 态全对齐） |
-| M MCP Apps | 0/4 | UI 资源代理 + ui_context 注入（M3） |
-| A A2A | 0/4 | POST / JSON-RPC（M2） |
+| S 基础 | **8/8 全绿** | ——（S5 userHeaders per-call 已实现：别名直连 MCP 调用 + _meta 双通道 + qualified 直调 fail-closed） |
+| F 文件 | **7/7 全绿** | ——（F2 图片经 admitEncodedImages→ImageBlock→请求 image_url 内联；模型须声明 `input:[text,image]`） |
+| H HITL | **7/7 全绿** | —— |
+| A A2A | **5/5 全绿** | ——（POST / JSON-RPC message/send·stream·tasks/get + llm-calls 事件化记录/隔离） |
+| M MCP Apps | 1/4 | UI 资源代理 + ui_context 注入（M3） |
 | SK/HA/FW/MEM | 0/10 | 技能 L4 管理（M3）、history 归档双源（M3）、平台库兼容（FW 为 Java agent_state 专属）、记忆关断（M3） |
 
-复跑方式：`node e2e/run-af-e2e.sh`（自起 mock LLM + bench/approval MCP + dsh 运行时于 :8100，
-再以 AF playwright 套件实跑；需 agent-framework 仓库同层克隆）。
+复跑：`AF_E2E_ROOT=<agent-manager>/agent-framework/e2e bash e2e/run-af-e2e.sh`；
+CI：`.github/workflows/ci.yml`（单测 + M0 冒烟 24 断言 + AF 门禁 S/F/H 组 + ask-deny 回归）。
 
 ## release-agent 切换验证（2026-10-02，已切换）
 
