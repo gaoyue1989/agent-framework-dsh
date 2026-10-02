@@ -1,0 +1,23 @@
+{
+  "name": "@oaf/oaf-server",
+  "version": "0.1.0-m0",
+  "description": "OAF 对外面插件：threads/chat SSE（AF 帧词表）+ subscribe/status + health + 事件镜像（设计 §5.1/§5.2）",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./frames": "./lib/frames.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/frames.js"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@deepseek-ai/cordis": "~4.0.4",
+    "@deepseek-ai/dsh-llm": "0.2.0-rc.2",
+    "@deepseek-ai/schemastery": "~3.18.4",
+    "@oaf/oaf-common": "workspace:*"
+  }
+}

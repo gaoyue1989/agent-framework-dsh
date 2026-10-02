@@ -1,0 +1,8 @@
+**/node_modules
+.dsh-home
+e2e
+test
+.git
+*.log
+Makefile
+README.md

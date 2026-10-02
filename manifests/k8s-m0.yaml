@@ -1,0 +1,82 @@
+# agent-framework-dsh M0 探针 K8s 部署清单（设计 §7：同 env 契约、同探针约定、平台零改动）。
+#
+# 用途：kind 集群内部署验证（非生产形态；副本数/资源限额/Ingress 接入按 M1+ 里程碑补齐）。
+# 部署：kind load docker-image agent-framework-dsh:m0 --name agent-manager && kubectl apply -f manifests/k8s-m0.yaml
+# 验证：kubectl -n agent-platform get pod -l app=oaf-dsh-agent
+#       curl http://127.0.0.1:30890/health（NodePort 30890）
+#
+# 环境变量按 AF C18 契约；敏感值以字面量内嵌仅适用于 M0 探针集群（生产走平台 Secret 路由）。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oaf-dsh-agent
+  namespace: agent-platform
+  labels:
+    app: oaf-dsh-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: oaf-dsh-agent
+  template:
+    metadata:
+      labels:
+        app: oaf-dsh-agent
+    spec:
+      containers:
+        - name: runtime
+          image: agent-framework-dsh:m0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8100
+          env:
+            - name: AGENT_CONFIG_DIR
+              value: /config
+            - name: AGENT_WORKSPACE_DIR
+              value: /workspace
+            - name: SERVER_HOST
+              value: 0.0.0.0
+            - name: SERVER_PORT
+              value: "8100"
+            # M0 探针：LLM 指向宿主 mock LLM（经 socat 0.0.0.0 转发，kind 网关 172.20.0.1）
+            - name: LLM_BASE_URL
+              value: http://172.20.0.1:18099/v1
+            - name: LLM_API_KEY
+              value: mock-key
+            - name: LLM_MODEL_ID
+              value: gpt-mock
+            # 业务面专用库名（架构原则二：服务间数据隔离——独立 checkpoint 库）
+            - name: CHECKPOINT_JDBC_URL
+              value: jdbc:mysql://oaf-mysql.agent-platform.svc.cluster.local:3306/agent_framework_dsh
+            - name: CHECKPOINT_USERNAME
+              value: oaf_dsh
+            - name: CHECKPOINT_PASSWORD
+              value: OafDsh2026
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8100
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8100
+            initialDelaySeconds: 15
+            periodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: oaf-dsh-svc
+  namespace: agent-platform
+  labels:
+    app: oaf-dsh-agent
+spec:
+  type: NodePort
+  selector:
+    app: oaf-dsh-agent
+  ports:
+    - port: 8100
+      targetPort: 8100
+      nodePort: 30890

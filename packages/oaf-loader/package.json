@@ -1,0 +1,22 @@
+{
+  "name": "@oaf/oaf-loader",
+  "version": "0.1.0-m0",
+  "description": "OAF 包加载插件（M1 前置最小版）：AGENTS.md frontmatter → 系统提示词段 + mcp-configs → dsh-mcp-client 挂载 + ask 工具 M0 安全降级（deny）",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/index.js"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@deepseek-ai/cordis": "~4.0.4",
+    "@deepseek-ai/dsh-mcp-client": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-mcp-resources": "0.2.0-rc.2",
+    "@deepseek-ai/schemastery": "~3.18.4",
+    "js-yaml": "^4.2.0"
+  }
+}

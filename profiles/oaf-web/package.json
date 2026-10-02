@@ -1,0 +1,22 @@
+{
+  "name": "oaf-profile-web",
+  "version": "0.1.0-m0",
+  "private": true,
+  "description": "OAF 平行运行时 profile：dsh-base + webserver + oaf 插件族（M0）",
+  "type": "module",
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "@deepseek-ai/dsh-base"
+      ]
+    }
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh-base": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-host-webserver": "0.2.0-rc.2",
+    "@oaf/oaf-common": "workspace:*",
+    "@oaf/oaf-loader": "workspace:*",
+    "@oaf/oaf-mysql-persistence": "workspace:*",
+    "@oaf/oaf-server": "workspace:*"
+  }
+}

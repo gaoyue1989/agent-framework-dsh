@@ -1,0 +1,20 @@
+{
+  "name": "agent-framework-dsh",
+  "version": "0.1.0-m0",
+  "private": true,
+  "description": "OAF 平行业务运行时（基于 DeepSeek Harness dsh 插件体系重建 agent-framework 对外功能，M0 探针）",
+  "type": "module",
+  "packageManager": "pnpm@10.33.2",
+  "scripts": {
+    "boot": "node scripts/boot.mjs",
+    "smoke": "node e2e/smoke.mjs",
+    "test": "node --test \"test/*.test.mjs\""
+  },
+  "devDependencies": {
+    "@deepseek-ai/dsh": "0.2.0-rc.2",
+    "@oaf/oaf-server": "workspace:*"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

@@ -1,0 +1,87 @@
+# OAF 平行运行时（M0）profile 补丁层 —— 叠加在 @deepseek-ai/dsh-base 之上。
+#
+# 分层语义（dsh 组合模型）：dsh-base 提供内核（llm/session/agent-loop/工具/默认权限），
+# 本文件按行 id 寻址改配 + insert 本仓库插件族；env → 配置的合成即设计文档 §7 的
+# 「启动器」职责（!!js 表达式做简单值，复杂逻辑留给启动脚本）。
+#
+# M0 范围：webserver + 单 turn 对话 + SSE 帧 + MySQL 事件落库（session_log + session_event 镜像）。
+# 设计依据 docs/design/deepseek-harness-plugin-runtime-design.md §4/§5。
+
+# ── HTTP 面（C1）：AF 端点全部注册在 dsh-host-webserver 路由表 ──
+- insert:
+    - id: webserver
+      name: '@deepseek-ai/dsh-host-webserver'
+      config:
+        host: !!js "process.env.SERVER_HOST === '0.0.0.0' ? '0.0.0.0' : '127.0.0.1'"
+        port: !!js "Number(process.env.SERVER_PORT ?? 8100)"
+
+# ── LLM 面（C14/C18）：LLM_* 契约 → pi-ai OpenAI 兼容网关路由 ──
+# apiKeyEnv 是凭据引用名（经 ctx.credentials 按请求解析），密钥本身不进配置。
+- id: llm-pi-ai
+  config:
+    providers:
+      oaf-system:
+        api: openai-completions
+        baseURL: !!js "process.env.LLM_BASE_URL ?? 'http://127.0.0.1:18081/v1'"
+        apiKeyEnv: LLM_API_KEY
+        models:
+          - id: !!js "process.env.LLM_MODEL_ID ?? 'gpt-mock'"
+
+- id: agent-default-model
+  config:
+    provider: oaf-system
+    model: !!js "process.env.LLM_MODEL_ID ?? 'gpt-mock'"
+
+# dsh-base 自带 DeepSeek 官方适配器（账号/API-Key 发现）；OAF 契约走 pi-ai 网关，关闭官方路由。
+- id: llm-deepseek
+  disabled: true
+
+- id: llm-deepseek-account
+  disabled: true
+
+# 会话标题的 LLM 生成会在 turn 外发起额外模型调用（污染 e2e mock 回放路由，也非 M0 验收项）；
+# 标题回落策略（session-title 的非 LLM fallback）保留。
+- id: session-title-llm
+  disabled: true
+
+# ── 持久化（C10）：关闭 JSONL 落盘，替换为 MySQL session_log provider ──
+# Pod 文件系统只读安全的前提；写契约见 docs/design/deepseek-harness-plugin-runtime-design.md §6.1。
+- id: session-persistence-jsonl
+  disabled: true
+
+- insert:
+    - id: oaf-mysql-persistence
+      name: '@oaf/oaf-mysql-persistence'
+      config:
+        jdbcUrl: !!js "process.env.CHECKPOINT_JDBC_URL ?? 'jdbc:mysql://127.0.0.1:3307/agent_framework_dsh'"
+        username: !!js "process.env.CHECKPOINT_USERNAME ?? 'root'"
+        password: !!js "process.env.CHECKPOINT_PASSWORD ?? ''"
+
+# ── OAF 对外面（C1/C2/C3）：threads/chat SSE + subscribe/status + health ──
+- insert:
+    - id: oaf-server
+      name: '@oaf/oaf-server'
+      config:
+        agentName: !!js "process.env.AGENT_NAME ?? 'oaf-dsh-agent'"
+        slug: !!js "process.env.AGENT_SLUG ?? 'oaf-dsh-agent'"
+        version: !!js "process.env.AGENT_VERSION ?? '1.0.0'"
+        description: !!js "process.env.AGENT_DESCRIPTION ?? 'OAF agent runtime (dsh parallel runtime, M0)'"
+        engine: 'DeepSeek Harness (dsh 0.2.0-rc.2)'
+        # 系统模型（C18 LLM_* 契约）：程序化 create/resume 必须显式传 agentOptions
+        # （dsh-agent-default-model 只服务 Host/传输面，不经 ctx.agents.create 路径）
+        systemProvider: oaf-system
+        systemModel: !!js "process.env.LLM_MODEL_ID ?? 'gpt-mock'"
+        # C7 多租户：userId 三来源（X-User-Id header > body.userId > debug-user），会话数据按 userId 命名空间
+        defaultUserId: debug-user
+        # turn 租约（C11）：M0 进程内互斥 + waiting 帧；跨副本 Redis 租约按设计列入 M2
+        queueTimeoutSeconds: !!js "Number(process.env.AGENT_QUEUE_TIMEOUT_SECONDS ?? 120)"
+        waitingFrameIntervalSeconds: 15
+        heartbeatIntervalSeconds: 20
+
+# ── OAF 包加载（C4 最小版）：AGENTS.md 提示词 + mcp-configs MCP 桥 + ask 工具安全降级 ──
+- insert:
+    - id: oaf-loader
+      name: '@oaf/oaf-loader'
+      config:
+        configDir: !!js "process.env.AGENT_CONFIG_DIR ?? '/config'"
+        askDeny: true

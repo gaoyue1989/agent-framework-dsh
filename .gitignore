@@ -1,0 +1,5 @@
+node_modules/
+.dsh-home/
+*.log
+# dsh launcher 在 profile 目录自动生成的根入口表（空列表；编辑请改 cordis.patch.yml）
+profiles/*/cordis.yml
