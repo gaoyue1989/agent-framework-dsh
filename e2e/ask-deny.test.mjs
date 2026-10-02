@@ -6,7 +6,7 @@
  * 且工具体从未执行（假 server 的调用计数为 0）。
  */
 import { execSync, spawn } from 'node:child_process';
-import { mkdirSync, writeFileSync, readFileSync, cpSync, rmSync } from 'node:fs';
+import { mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
@@ -84,12 +84,34 @@ setInterval(() => {}, 1 << 30);
 process.on('SIGTERM', () => process.exit(0));
 `);
 
-// 2. 包副本：mcp url 指向假 server
+// 2. 自建 OAF 包 fixture（自包含，无跨仓依赖）：最小 AGENTS.md + ask 权限 + MCP 指向假 server
 const pkgDir = path.join(TMP, 'oaf-package');
-cpSync('/root/agent-manager/release-agent', pkgDir, { recursive: true });
-const mcpCfg = readFileSync(path.join(pkgDir, 'mcp-configs/platform/config.yaml'), 'utf8')
-  .replace('http://platform-backend.agent-platform.svc.cluster.local:8080/mcp', `http://127.0.0.1:${MCP_PORT}/mcp`);
-writeFileSync(path.join(pkgDir, 'mcp-configs/platform/config.yaml'), mcpCfg);
+mkdirSync(path.join(pkgDir, 'mcp-configs', 'platform'), { recursive: true });
+writeFileSync(path.join(pkgDir, 'AGENTS.md'), `---
+name: "Ask Deny Test Agent"
+version: "1.0.0"
+slug: "test/ask-deny"
+description: "ask-deny 确定性验证用"
+---
+
+# 测试助手
+
+收到指令时直接调用对应工具完成操作并简洁回复。
+`);
+writeFileSync(path.join(pkgDir, 'mcp-configs/platform/config.yaml'), `server: platform-publisher
+vendor: test
+version: "1.0.0"
+
+connection:
+  type: streamableHttp
+  url: http://127.0.0.1:${MCP_PORT}/mcp
+  timeout: 60
+
+permissions:
+  tools:
+    delete_service: ask
+    list_services: allow
+`);
 
 // 3. 回放夹具：模型直接发起 delete_service tool_call（OpenAI SSE chunks）。
 //    mock 路由用 MARKER_MAP 硬编码映射，借道 tool:write → tool-write.json；
@@ -116,7 +138,8 @@ writeFileSync(path.join(TMP, 'tool-write.json'), JSON.stringify({
 }));
 
 // 4. 起 mock LLM（自定义夹具目录）+ 假 MCP + 运行时
-const mock = spawn('node', [path.join(ROOT, '..', 'agent-framework', 'e2e', 'mock', 'llm-server.mjs')], {
+const afE2e = process.env.AF_E2E_DIR ?? path.join(ROOT, '..', 'agent-framework', 'e2e');
+const mock = spawn('node', [path.join(afE2e, 'mock', 'llm-server.mjs')], {
   env: { ...process.env, MOCK_LLM_PORT: String(MOCK_PORT), MOCK_LLM_FIXTURES: TMP },
   stdio: ['ignore', 'ignore', 'inherit'],
 });
@@ -164,14 +187,31 @@ try {
     raw += dec.decode(value, { stream: true });
     if (/"type":"AGENT_END"/.test(raw)) break;
   }
-  const toolNames = [...raw.matchAll(/"toolName":"([^"]+)"/g)].map((m) => m[1]);
-  check('模型发起了 ask 工具调用', toolNames.includes(TOOL), toolNames.join(','));
-  const endFrames = [...raw.matchAll(/"type":"TOOL_RESULT_END",([^}]*)\}/g)].map((m) => m[0]);
-  const denyEnd = endFrames.find((f) => f.includes(TOOL));
-  check('ask 工具执行被拦截为 ERROR（deny）', Boolean(denyEnd) && denyEnd.includes('"state":"ERROR"'), denyEnd ?? '无 TOOL_RESULT_END');
-  check('拒绝原因带安全降级说明', raw.includes('需要人工确认'));
-  const fakeCalls = execSync(`kill -0 ${fakeMcp.pid} 2>/dev/null; echo x`).toString() && 0; // 假 server 调用计数经日志核验
-  check('工具体未执行（假 server 无 DELETED 输出）', !raw.includes('DELETED'));
+  const askFrame = raw.match(/"type":"permission_ask"[^}]*/)?.[0];
+  const askTcid = raw.match(/permission_ask[\s\S]*?"tool_call_id":"([^"]+)"/)?.[1];
+  check('ask 工具触发 permission_ask 挂起帧（HITL 桥）', Boolean(askFrame) && Boolean(askTcid), askFrame ?? '无 permission_ask');
+  check('挂起帧工具名为裸名（AF 契约）', askFrame?.includes('"name":"delete_service"') ?? false);
+
+  // /confirm-stream 拒绝 → 恢复段 RESULT_END 为 DENIED/ERROR + 工具体未执行
+  const sid = raw.match(/"session_id":"([^"]+)"/)?.[1];
+  const rec = await fetch(`http://127.0.0.1:${RT_PORT}/threads/${sid}/confirm-stream`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ results: [{ tool_call_id: askTcid, confirmed: false }] }),
+  });
+  const r2 = rec.body.getReader(); const dec2 = new TextDecoder();
+  let raw2 = '';
+  const dl = Date.now() + 40_000;
+  for (;;) {
+    if (Date.now() > dl) break;
+    const { done, value } = await r2.read();
+    if (done) break;
+    raw2 += dec2.decode(value, { stream: true });
+    if (/"type":"AGENT_END"/.test(raw2) || /"type":"error"/.test(raw2)) break;
+  }
+  const denyEnd = [...raw2.matchAll(/"type":"TOOL_RESULT_END",([^}]*)\}/g)].map((m) => m[0]).find((f) => f.includes('delete_service') || f.includes(askTcid));
+  check('拒绝后恢复流 TOOL_RESULT_END 为 DENIED/ERROR', Boolean(denyEnd) && /DENIED|ERROR/.test(denyEnd), denyEnd ?? '无 TOOL_RESULT_END');
+  check('拒绝原因带审批语义（rejected/已拒绝）', raw2.includes('rejected') || raw2.includes('已拒绝'));
+  check('工具体未执行（假 server 无 DELETED 输出）', !raw2.includes('DELETED') && !raw.includes('DELETED'));
 } catch (err) {
   fail.push(`编排失败: ${err.message}`);
   console.error(err);

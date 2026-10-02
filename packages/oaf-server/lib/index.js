@@ -621,7 +621,15 @@ class OafServerService extends Service {
         const rt = this.runtimes.get(sessionId);
         if (!rt) return next();
         const callId = req.callId ? String(req.callId) : randomUUID();
-        const toolName = String(req.toolName ?? 'tool');
+        const toolNameQualified = String(req.toolName ?? 'tool');
+        // AF 契约：确认卡/帧展示裸名（剥 mcp__{server}__ 前缀）
+        const toolName = (() => {
+          for (const s of this.ctx.oafLoader?.mcpServers ?? []) {
+            const prefix = `mcp__${s}__`;
+            if (toolNameQualified.startsWith(prefix)) return toolNameQualified.slice(prefix.length);
+          }
+          return toolNameQualified;
+        })();
         const replyId = rt.turnState?.replyId ?? rt.lastReplyId ?? '';
         // confirm_context 落库（AF CAS：session 唯一挂起行）
         await this.pool.query(
