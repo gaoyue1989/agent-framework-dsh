@@ -3,7 +3,7 @@
 # mock LLM + bench/approval MCP + dsh oaf-web（AF e2e agent-config fixture）→ playwright api-core
 set -e
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-AF="$(cd "$ROOT/.." && pwd)/agent-framework/e2e"
+AF="${AF_E2E_ROOT:-$(cd "$ROOT/.." && pwd)/agent-framework/e2e}"
 [ -d "$AF" ] || { echo "需要 agent-framework 仓库同层克隆（$AF）"; exit 1; }
 BENCH_MCP_PORT=18082 APPROVAL_MCP_PORT=8813 MOCK_LLM_PORT=18081
 cleanup() { for f in /tmp/af-e2e-*.pid; do kill -9 "$(cat $f)" 2>/dev/null; rm -f $f; done; [ -n "$RT" ] && kill -9 $RT 2>/dev/null; }

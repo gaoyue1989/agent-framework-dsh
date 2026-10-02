@@ -87,6 +87,10 @@ export function summarizeMcpServer(oafConfig) {
       if (!uiMap[tool]) uiMap[tool] = typeof ref === 'string' ? ref : String(ref?.resource_uri ?? ref?.resourceUri ?? '');
     }
   }
+  const uh = oafConfig?.userHeaders;
+  const userHeaders = uh?.headers && typeof uh.headers === 'object'
+    ? { headers: { ...uh.headers }, onMissing: String(uh['on-missing'] ?? uh.onMissing ?? 'deny') }
+    : null;
   return {
     server: String(oafConfig?.server ?? ''),
     vendor: String(oafConfig?.vendor ?? ''),
@@ -96,7 +100,66 @@ export function summarizeMcpServer(oafConfig) {
     uiMap,
     appOnlyAll,
     appOnlySet,
+    userHeaders,
   };
+}
+
+/**
+ * 直连 MCP streamable-http 工具调用（S5 userHeaders per-call 注入的执行路径）：
+ * initialize → initialized → tools/call（params._meta 协议双通道 + 动态 HTTP header）。
+ * 每次调用独立会话；响应兼容 application/json 与 text/event-stream 两种回包。
+ */
+export async function directMcpToolCall(url, rawName, args, { dynamicHeaders = {}, staticHeaders = {}, meta, timeoutMs = 60_000 } = {}) {
+  const baseHeaders = {
+    'Content-Type': 'application/json',
+    Accept: 'application/json, text/event-stream',
+    ...staticHeaders,
+    ...dynamicHeaders,
+  };
+  const call = async (payload) => {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: baseHeaders,
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const sid = res.headers.get('mcp-session-id');
+    const ct = res.headers.get('content-type') ?? '';
+    const text = await res.text();
+    let json;
+    if (ct.includes('text/event-stream')) {
+      for (const line of text.split('\n')) {
+        if (line.startsWith('data:')) {
+          try {
+            const evt = JSON.parse(line.slice(5).trim());
+            if (evt.id !== undefined || evt.result || evt.error) { json = evt; break; }
+          } catch { /* 跳过坏行 */ }
+        }
+      }
+    } else {
+      try { json = JSON.parse(text); } catch { /* 下面统一报错 */ }
+    }
+    if (!json) throw new Error(`MCP 响应不可解析（http ${res.status}）`);
+    return { json, sid };
+  };
+  const init = await call({
+    jsonrpc: '2.0', id: 1, method: 'initialize',
+    params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'oaf-runtime', version: '1.0.0' } },
+  });
+  if (init.json.error) throw new Error(`MCP initialize 失败: ${init.json.error.message ?? ''}`);
+  const sessionHeaders = init.sid ? { 'Mcp-Session-Id': init.sid } : {};
+  await fetch(url, {
+    method: 'POST',
+    headers: { ...baseHeaders, ...sessionHeaders },
+    body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }),
+    signal: AbortSignal.timeout(timeoutMs),
+  }).catch(() => {});
+  const result = await call({
+    jsonrpc: '2.0', id: 2, method: 'tools/call',
+    params: { name: rawName, arguments: args ?? {}, ...(meta ? { _meta: meta } : {}) },
+  });
+  if (result.json.error) throw new Error(`MCP tools/call 失败: ${result.json.error.message ?? ''}`);
+  return result.json.result;
 }
 
 /** 扫描 configDir/skills 目录下的 SKILL.md（声明 ∪ 目录事实，目录缺失返回空）。 */
@@ -208,6 +271,8 @@ class OafLoaderService extends Service {
       const raw = rest.slice(idx + 2);
       if (!raw || seen.has(raw)) continue; // 首服务器优先（同名单工具跨 server 时）
       seen.add(raw);
+      const serverName = rest.slice(0, idx);
+      const meta = this.mcpMeta.get(serverName);
       try {
         const disposer = this.ctx.tools.register(defineTool({
           name: raw,
@@ -221,7 +286,21 @@ class OafLoaderService extends Service {
             },
             render: (_args, value) => [{ type: 'text', text: String(value?.text ?? '').slice(0, 8000) }],
           },
-          execute: async (args) => {
+          execute: async (args, exec) => {
+            // S5：userHeaders server → 直连 MCP 调用，按调用方 userId 注入 header + _meta 双通道
+            if (meta?.userHeaders) {
+              const sessionId = String(exec?.agent?.id ?? '');
+              const userId = this.userIdResolver ? this.userIdResolver(sessionId) : null;
+              if (!userId && meta.userHeaders.onMissing !== 'passthrough') {
+                return { text: `Error: 用户身份缺失（userHeaders on-missing: ${meta.userHeaders.onMissing}），已拒绝调用 ${raw}` };
+              }
+              const result = await directMcpToolCall(meta.url, raw, args, {
+                dynamicHeaders: { 'X-User-Id': userId ?? '' },
+                meta: { userId: userId ?? '' },
+                timeoutMs: 60_000,
+              });
+              return { text: JSON.stringify(result ?? {}) };
+            }
             this.rawAliasBypass?.add(q);
             const result = await this.ctx.tools.execute({
               callId: randomUUID(),

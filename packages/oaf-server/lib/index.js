@@ -19,6 +19,7 @@
 import { randomUUID } from 'node:crypto';
 import { Service } from '@deepseek-ai/cordis';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
+import { admitEncodedImages } from '@deepseek-ai/dsh-attachment';
 import { createPool, ensureDatabase, migrate, withTxn } from '@oaf/oaf-common';
 import {
   createTurnSerializer,
@@ -32,7 +33,7 @@ import {
 
 export const name = 'oaf-server';
 /** 服务依赖：webserver（路由）+ agents（协议驱动）+ sessionPersistence（resume/history）+ oafLoader（包元数据）+ oafTools（内置工具）。 */
-export const inject = ['webServer', 'agents', 'sessionPersistence', 'oafLoader', 'oafTools', 'tools'];
+export const inject = ['webServer', 'agents', 'sessionPersistence', 'oafLoader', 'oafTools', 'tools', 'attachments'];
 
 const MIGRATIONS = [
   {
@@ -84,6 +85,14 @@ const MIGRATIONS = [
          KEY idx_session (session_id, created_at)
        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
       `ALTER TABLE session_user ADD COLUMN title_source VARCHAR(16) NOT NULL DEFAULT ''`,
+    ],
+  },
+  {
+    version: 3,
+    name: 'oaf-server-llm-calls-v3',
+    sql: [
+      'ALTER TABLE llm_call ADD COLUMN response_json MEDIUMTEXT NULL',
+      'ALTER TABLE llm_call ADD COLUMN created_ms BIGINT NULL',
     ],
   },
 ];
@@ -237,6 +246,11 @@ const MIME_RULES = [
 ];
 const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
 
+/** JSON 容错解析（llm-calls 返回契约：坏行不给 500）。 */
+function safeParse(text) {
+  try { return JSON.parse(text ?? '{}'); } catch { return {}; }
+}
+
 export function validateUpload(fileName, mime, size) {
   if (size === 0) return { status: 400, error: 'no_file_uploaded' };
   if (size > MAX_UPLOAD_BYTES) return { status: 413, error: 'file_too_large' };
@@ -253,7 +267,7 @@ export function validateUpload(fileName, mime, size) {
  * OAF 对外面服务。
  */
 class OafServerService extends Service {
-  static inject = ['webServer', 'agents', 'sessionPersistence', 'oafLoader', 'oafTools', 'tools'];
+  static inject = ['webServer', 'agents', 'sessionPersistence', 'oafLoader', 'oafTools', 'tools', 'attachments'];
 
   constructor(ctx, config) {
     super(ctx, 'oafServer');
@@ -300,11 +314,11 @@ class OafServerService extends Service {
     this.installHitlBridge();
     // 裸名别名（AF 契约名）：MCP client 工具注册完成后兜底执行
     try {
-      const names = (this.ctx.tools.schemas() ?? []).map((s) => s.name);
-      console.warn('[oaf-server] init 时 registry 工具数 =', names.length, '| mcp 前缀 =', names.filter((n) => n.startsWith('mcp__')).length);
       const stats = this.ctx.oafLoader.registerRawAliases();
       console.warn('[oaf-server] 裸名别名注册:', JSON.stringify(stats));
     } catch (err) { console.error('[oaf-server] 裸名别名注册失败:', err); }
+    // S5：sessionId → userId 解析器（别名直调 userHeaders 注入用）
+    this.ctx.oafLoader.userIdResolver = (sessionId) => this.runtimes.get(String(sessionId))?.userId ?? null;
     this.mountRoutes(this.ctx.webServer);
   }
 
@@ -344,16 +358,6 @@ class OafServerService extends Service {
       }),
       // 会话标题（dsh session-title 服务产出）→ session_user.title（手动命名 sticky）
       this.ctx.on('session/title', (session, data) => this.onSessionTitle(String(session?.header?.id ?? ''), data)),
-      // LLM 调用记录（/threads/{sid}/llm-calls 数据源）
-      this.ctx.on('llm/stream', (options, next) => {
-        if (options?.sessionId) {
-          this.pool.query(
-            'INSERT INTO llm_call (session_id, call_id, model, request_json) VALUES (?, ?, ?, ?)',
-            [String(options.sessionId), randomUUID(), String(options.model ?? ''), JSON.stringify({ provider: options.provider ?? '', model: options.model ?? '' }),
-            ]).catch(() => {});
-        }
-        return next();
-      }),
       // 交付物就绪 → file_ready 帧（在 present_* 工具 post-execute 后 flush，保证帧序在结果之后）
       this.ctx.on('oaf/file-ready', ({ sessionId, asset }) => {
         const q = this.fileReadyQueue.get(sessionId) ?? [];
@@ -420,9 +424,27 @@ class OafServerService extends Service {
       const frames = settledEventFrames(s, event);
       if (frames.length) await this.emitEventFrames(rt, frames, s.replyId);
     }
+    if (event.type === 'user/message') {
+      // A5/A6 契约：llm-calls 的 request.messages 收真实用户消息（过滤 dsh 运行时快照）
+      const t = textOfBlocks(event.data?.content);
+      if (t && !t.startsWith('Current runtime context')) {
+        rt.userMsgBuffer = [...(rt.userMsgBuffer ?? []), t.slice(0, 2000)].slice(-20);
+      }
+    }
     if (event.type === 'assistant/message') {
       const text = textOfBlocks(event.data?.message?.content);
       if (text) rt.lastAssistantText = text;
+      // llm-calls 事件化记录（A5：call_id 带 call- 前缀、timestamp 毫秒、USER 大写、usage 三键）
+      const u = event.data?.usage ?? {};
+      const inTok = Number(u.inputTokens ?? 0);
+      const outTok = Number(u.outputTokens ?? 0);
+      this.pool.query(
+        'INSERT INTO llm_call (session_id, call_id, model, request_json, response_json, created_ms) VALUES (?, ?, ?, ?, ?, ?)',
+        [sessionId, `call-${randomUUID()}`, String(event.data?.message?.source?.provider ?? ''),
+         JSON.stringify({ messages: (rt.userMsgBuffer ?? []).map((c) => ({ role: 'USER', content: c })) }),
+         JSON.stringify({ usage: { input_tokens: inTok, output_tokens: outTok, total_tokens: Number(u.totalTokens ?? inTok + outTok) } }),
+         Number(event.time ?? Date.now())],
+      ).catch(() => {});
     }
     if (event.type === 'turn/end') {
       rt.turnOpen = false;
@@ -479,7 +501,7 @@ class OafServerService extends Service {
     }
     return new Promise((resolve) => {
       const waiter = {};
-      const timer = waitingFrameMs > 0
+      const timer = waitingFrameMs > 0 && writer
         ? setInterval(() => writer.control(controlFrames.waiting()), waitingFrameMs)
         : null;
       const cleanup = () => {
@@ -490,15 +512,53 @@ class OafServerService extends Service {
       };
       waiter.timeout = setTimeout(() => {
         cleanup();
-        writer.control(controlFrames.error(
-          `turn_in_progress: session '${rt.sessionId}' has an active turn and queue timeout reached`,
-        ));
-        writer.end();
+        if (writer) {
+          writer.control(controlFrames.error(
+            `turn_in_progress: session '${rt.sessionId}' has an active turn and queue timeout reached`,
+          ));
+          writer.end();
+        }
         resolve(false);
       }, queueTimeoutMs);
       waiter.grant = () => { cleanup(); resolve(true); };
       rt.waiters.push(waiter);
     });
+  }
+
+  /** turn 启动共用（chat SSE / A2A send/stream）：租约 + 附加 agent + followup。 */
+  async startTurn(sessionId, userId, text, writer = null) {
+    const rt = this.runtimeOf(sessionId);
+    rt.userId = userId;
+    if (rt.asking) {
+      return { ok: false, rt, error: `turn_pending_confirm: session '${sessionId}' is in ASKING state（先走确认流程再发新消息）` };
+    }
+    const ok = await this.acquireLease(rt, writer, {
+      queueTimeoutMs: (this.config.queueTimeoutSeconds ?? 120) * 1000,
+      waitingFrameMs: 0,
+    });
+    if (!ok) {
+      return { ok: false, rt, error: `turn_in_progress: session '${sessionId}' has an active turn and queue timeout reached` };
+    }
+    if (writer) rt.writers.add(writer);
+    try {
+      await this.store.upsertSessionUser(sessionId, userId);
+      const agent = await this.attachAgent(rt);
+      agent.followup(createUserMessage({
+        content: [{ type: 'text', text }],
+        source: { kind: 'user' },
+      }));
+      return { ok: true, rt };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (writer) {
+        writer.control(controlFrames.error(message));
+        writer.end();
+      }
+      rt.writers.delete(writer);
+      rt.turnOpen = false;
+      this.releaseLease(rt);
+      return { ok: false, rt, error: message };
+    }
   }
 
   releaseLease(rt) {
@@ -753,6 +813,7 @@ class OafServerService extends Service {
     } });
 
     register({ kind: 'exact', path: '/', handler: async (req, res) => {
+      if (req.method === 'POST') return this.handleA2A(req, res); // A2A v1.0.0 JSON-RPC（C8）
       this.json(res, 200, {
         agent: this.loaderAgentName(),
         slug: this.ctx.oafLoader?.slug || cfg.slug,
@@ -940,25 +1001,26 @@ class OafServerService extends Service {
       return;
     }
 
-    const ok = await this.acquireLease(rt, writer, {
+    const acquire = await this.acquireLease(rt, writer, {
       queueTimeoutMs: (cfg.queueTimeoutSeconds ?? 120) * 1000,
       waitingFrameMs: (cfg.waitingFrameIntervalSeconds ?? 15) * 1000,
     });
-    if (!ok) return;
+    if (!acquire) return;
 
     if (fresh) writer.control(controlFrames.sessionCreated(sessionId));
     rt.writers.add(writer);
     try {
       await this.store.upsertSessionUser(sessionId, userId);
       const agent = await this.attachAgent(rt);
-      // fileIds 注入（F1）：物化进工作区 uploads/ + 消息文本块提及（图片内联走 M1 attachment 管线）
-      const injected = await this.materializeFiles(sessionId, userId, fileIds, await this.workspaceFor(sessionId));
+      // fileIds 注入（F1/F2）：图片 → attachment ImageBlock 内联；文档 → 工作区 uploads/ 物化
+      const { injected, imageContent } = await this.materializeFiles(sessionId, userId, fileIds, await this.workspaceFor(sessionId));
       const mentions = injected.length ? `\n\n[已注入工作区文件: ${injected.join(', ')}]` : '';
       agent.followup(createUserMessage({
-        content: [{ type: 'text', text: message + mentions }],
+        content: [{ type: 'text', text: message + mentions }, ...imageContent],
         source: { kind: 'user' },
       }));
     } catch (err) {
+      console.error('[oaf-server] chat 启动失败:', err);
       writer.control(controlFrames.error(err instanceof Error ? err.message : String(err)));
       writer.end();
       rt.writers.delete(writer);
@@ -969,21 +1031,35 @@ class OafServerService extends Service {
 
   /** fileIds → 工作区物化（AF UploadWorkspaceInjector 语义的本地档）。 */
   async materializeFiles(sessionId, userId, fileIds, workspaceDir) {
-    if (!fileIds?.length) return [];
-    const { copyFileSync, mkdirSync } = await import('node:fs');
+    if (!fileIds?.length) return { injected: [], imageContent: [] };
+    const { copyFileSync, mkdirSync, readFileSync } = await import('node:fs');
     const path = await import('node:path');
     const injected = [];
+    const imageContent = [];
     const destDir = path.join(workspaceDir, 'uploads');
     mkdirSync(destDir, { recursive: true });
     const root = process.env.OAF_FILES_DIR ?? '/tmp/oaf-dsh-files';
     for (const fileId of fileIds) {
-      const [rows] = await this.pool.query('SELECT file_name, storage_type, storage_key FROM file_asset WHERE id = ?', [String(fileId)]);
+      const [rows] = await this.pool.query('SELECT file_name, mime_type, storage_type, storage_key FROM file_asset WHERE id = ?', [String(fileId)]);
       const row = rows[0];
       if (!row || row.storage_type !== 'local') continue;
+      const bytes = readFileSync(path.join(root, row.storage_key));
+      if (/^image\//.test(row.mime_type)) {
+        // F2：图片走 attachment 管线（ImageBlock → 请求投影 image_url/data URL）
+        try {
+          const refs = await admitEncodedImages(this.ctx.attachments, [{
+            data: bytes.toString('base64'), mediaType: row.mime_type, name: row.file_name,
+          }]);
+          for (const ref of refs) imageContent.push({ type: 'image', attachment: ref });
+          continue;
+        } catch (err) {
+          console.error('[oaf-server] 图片 admission 失败，回落文本注入:', err?.message ?? err);
+        }
+      }
       copyFileSync(path.join(root, row.storage_key), path.join(destDir, row.file_name));
       injected.push(`uploads/${row.file_name}`);
     }
-    return injected;
+    return { injected, imageContent };
   }
 
   handleSubscribe(req, res, sessionId) {
@@ -1085,12 +1161,18 @@ class OafServerService extends Service {
 
   async handleLlmCalls(req, res, sessionId) {
     const [rows] = await this.pool.query(
-      'SELECT call_id, model, request_json, created_at FROM llm_call WHERE session_id = ? ORDER BY id ASC LIMIT 500',
+      'SELECT call_id, model, request_json, response_json, created_ms FROM llm_call WHERE session_id = ? ORDER BY id ASC LIMIT 500',
       [sessionId],
     );
     this.json(res, 200, {
       session_id: sessionId,
-      calls: rows.map((r) => ({ call_id: r.call_id, timestamp: r.created_at, model: r.model, request: r.request_json })),
+      calls: rows.map((r) => ({
+        call_id: r.call_id,
+        timestamp: Number(r.created_ms ?? 0),
+        model: r.model,
+        request: safeParse(r.request_json),
+        response: safeParse(r.response_json),
+      })),
     });
   }
 
@@ -1274,6 +1356,107 @@ class OafServerService extends Service {
       'X-Content-Type-Options': 'nosniff',
     });
     createReadStream(file).pipe(res);
+  }
+
+  /** A2A v1.0.0 JSON-RPC（C8）：message/send（阻塞）、message/stream（SSE）、tasks/get。
+   *  已声明限制（AF 同款语义）：A2A 通道不支持 ask 工具——ask 挂起以 input-required 终态回。 */
+  parseA2aMessage(msg) {
+    const parts = Array.isArray(msg?.parts) ? msg.parts : [];
+    const text = parts.filter((p) => p?.kind === 'text').map((p) => String(p.text ?? '')).join('');
+    const meta = msg?.metadata ?? {};
+    return {
+      text,
+      userId: meta.userId ? String(meta.userId) : undefined,
+      sessionId: meta.sessionId ? String(meta.sessionId) : undefined,
+    };
+  }
+
+  async handleA2A(req, res) {
+    let body;
+    try {
+      body = JSON.parse((await this.readBody(req, 2 * 1024 * 1024)).toString('utf8') || '{}');
+    } catch {
+      return this.json(res, 400, { jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } });
+    }
+    const { id, method, params } = body;
+    const reply = (result) => this.json(res, 200, { jsonrpc: '2.0', id, result });
+    const replyError = (code, message) => this.json(res, 200, { jsonrpc: '2.0', id, error: { code, message } });
+
+    switch (method) {
+      case 'message/send': {
+        const { text, userId, sessionId: metaSid } = this.parseA2aMessage(params?.message);
+        const sessionId = metaSid || randomUUID();
+        const { ok, rt, error } = await this.startTurn(sessionId, userId ?? this.config.defaultUserId, text || '[A2A empty message]');
+        if (!ok) return replyError(-32002, error);
+        const taskId = randomUUID();
+        const deadline = Date.now() + 120_000;
+        while ((rt.busy || rt.turnOpen) && Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 250));
+        }
+        return reply({
+          kind: 'message',
+          messageId: randomUUID(),
+          role: 'agent',
+          taskId,
+          parts: [{ kind: 'text', text: rt?.lastAssistantText ?? '' }],
+          contextId: sessionId,
+        });
+      }
+      case 'message/stream': {
+        const { text, userId, sessionId: metaSid } = this.parseA2aMessage(params?.message);
+        const sessionId = metaSid || randomUUID();
+        const taskId = randomUUID();
+        res.writeHead(200, sseHeaders());
+        let closed = false;
+        const a2aWriter = {
+          tail: false,
+          lastWrittenSeq: 0,
+          alive: true,
+          detach() { this.alive = false; },
+          control() { /* A2A 无控制帧 */ },
+          event(_seq, payload) {
+            if (closed || !this.alive) return;
+            let update;
+            if (payload.type === 'AGENT_START') {
+              update = { kind: 'status-update', taskId, contextId: sessionId, status: { state: 'working' }, final: false };
+            } else if (payload.type === 'AGENT_END') {
+              update = { kind: 'status-update', taskId, contextId: sessionId, status: { state: 'completed' }, final: true };
+            } else if (payload.type === 'permission_ask') {
+              update = { kind: 'status-update', taskId, contextId: sessionId, status: { state: 'input-required', message: { role: 'agent', parts: [{ kind: 'text', text: 'A2A 通道不支持 ask 工具，请走 /threads/chat 确认链路' }] } }, final: true };
+            } else {
+              return; // 内容帧不透传（A2A 面只发任务状态；AF 同款 convertToSse 语义）
+            }
+            try { res.write(`data: ${JSON.stringify({ jsonrpc: '2.0', id, result: update })}\n\n`); } catch { this.alive = false; }
+            if (payload.type === 'AGENT_END' || payload.type === 'permission_ask') {
+              closed = true;
+              try { res.end(); } catch { /* 已断开 */ }
+            }
+          },
+          end() {
+            if (closed) return;
+            closed = true;
+            try { res.end(); } catch { /* 已断开 */ }
+          },
+        };
+        const { ok, rt, error } = await this.startTurn(sessionId, userId ?? this.config.defaultUserId, text || '[A2A empty message]', a2aWriter);
+        if (!ok) {
+          res.write(`data: ${JSON.stringify({ jsonrpc: '2.0', id, error: { code: -32002, message: error } })}\n\n`);
+          return res.end();
+        }
+        void rt;
+        return;
+      }
+      case 'tasks/get': {
+        // 任务快照：从会话日志派生（AF MySqlTaskStore「读日志构造、save no-op」思路）。
+        // A2A 发起的 turn 无独立 task 持久化，返回 unknown 态快照（不报 Method not found）。
+        return reply({ kind: 'task', id: String(params?.id ?? ''), status: { state: 'unknown' } });
+      }
+      case 'tasks/cancel':
+      case 'tasks/resubscribe':
+        return replyError(-32001, 'task not found（当前运行时未持久化 A2A task 索引）');
+      default:
+        return replyError(-32601, `Method not found: ${method}`);
+    }
   }
 
   /** /mcp/{server}/tools/{tool}（POST）与 /mcp/{server}/resources（GET，占位）。 */

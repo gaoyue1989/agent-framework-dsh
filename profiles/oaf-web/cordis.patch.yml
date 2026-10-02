@@ -26,6 +26,7 @@
         apiKeyEnv: LLM_API_KEY
         models:
           - id: !!js "process.env.LLM_MODEL_ID ?? 'gpt-mock'"
+            input: [text, image]
 
 - id: agent-default-model
   config:
