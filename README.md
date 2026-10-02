@@ -84,6 +84,23 @@ make run                     # 启动（需 LLM_* / CHECKPOINT_*，见 scripts/b
 环境变量同 AF C18 契约：`LLM_API_KEY/LLM_MODEL_ID/LLM_BASE_URL`（必填）、
 `CHECKPOINT_JDBC_URL/_USERNAME/_PASSWORD`、`SERVER_HOST/SERVER_PORT`、`AGENT_WORKSPACE_DIR`。
 
+## e2e 门禁实况（AF playwright api-core，2026-10-02）
+
+以 agent-framework 同一套 e2e 套件（`agent-framework/e2e/tests/api-core.spec.ts`，51 用例）对 dsh 运行时实跑：
+**32 通过 / 18 红 / 1 skip**。分组实况：
+
+| 组 | 结果 | 红项与归属 |
+|---|---|---|
+| S 基础 | **7/8** | S5 userHeaders per-call 注入（MCP 多租户按用户调用，M2） |
+| F 文件 | **6/7** | F2 图片视觉内联（dsh attachment 管线，M1） |
+| H HITL | **7/7 全绿** | ——（approval 接缝桥接：ask 挂起/confirm-stream/同步 confirm/409/ASKING 态/denied 态全对齐） |
+| M MCP Apps | 0/4 | UI 资源代理 + ui_context 注入（M3） |
+| A A2A | 0/4 | POST / JSON-RPC（M2） |
+| SK/HA/FW/MEM | 0/10 | 技能 L4 管理（M3）、history 归档双源（M3）、平台库兼容（FW 为 Java agent_state 专属）、记忆关断（M3） |
+
+复跑方式：`node e2e/run-af-e2e.sh`（自起 mock LLM + bench/approval MCP + dsh 运行时于 :8100，
+再以 AF playwright 套件实跑；需 agent-framework 仓库同层克隆）。
+
 ## release-agent 切换验证（2026-10-02，已切换）
 
 `oaf-release-agent`（智能发布助手）已切换为 dsh 运行时：`packages/oaf-loader` 实现 OAF 包最小加载
