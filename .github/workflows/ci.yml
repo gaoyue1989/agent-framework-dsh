@@ -69,4 +69,7 @@ jobs:
         working-directory: agent-framework-dsh
         env:
           AF_E2E_DIR: ${{ github.workspace }}/agent-manager/agent-framework/e2e
+          CHECKPOINT_JDBC_URL: jdbc:mysql://127.0.0.1:3306/agent_framework_dsh
+          CHECKPOINT_USERNAME: e2e
+          CHECKPOINT_PASSWORD: e2e-pass
         run: make test-ask-deny
