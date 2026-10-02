@@ -98,8 +98,11 @@ make run                     # 启动（需 LLM_* / CHECKPOINT_*，见 scripts/b
 | M MCP Apps | 1/4 | UI 资源代理 + ui_context 注入（M3） |
 | SK/HA/FW/MEM | 0/10 | 技能 L4 管理（M3）、history 归档双源（M3）、平台库兼容（FW 为 Java agent_state 专属）、记忆关断（M3） |
 
-复跑：`AF_E2E_ROOT=<agent-manager>/agent-framework/e2e bash e2e/run-af-e2e.sh`；
-CI：`.github/workflows/ci.yml`（单测 + M0 冒烟 24 断言 + AF 门禁 S/F/H 组 + ask-deny 回归）。
+复跑：`AF_E2E_ROOT=<agent-manager>/agent-framework/e2e bash e2e/run-af-e2e.sh`。
+
+**CI 门禁**（`.github/workflows/ci.yml`，master push/PR 触发，2026-10-02 首绿）：
+单元测试 13 + M0 冒烟 24 断言 + **AF 门禁 S/F/H 组 21 用例实跑** + ask-deny 确定性回归 5 断言，
+全部在 GitHub Actions（MySQL 8 service 容器 + 主仓 mock 基建 checkout）一票通过。
 
 ## release-agent 切换验证（2026-10-02，已切换）
 
