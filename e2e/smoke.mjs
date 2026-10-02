@@ -65,7 +65,24 @@ function check(name, ok, detail = '') {
   }
 }
 
-function dockerMySql(sql) {
+/** MySQL 断言通道：mysql2 直连（mysql 解析 CHECKPOINT_JDBC_URL，本地/CI/转发环境同路径）。 */
+async function dbQuery(sql) {
+  const mysql = await import('mysql2/promise');
+  const m = /jdbc:mysql:\/\/([^:/]+):(\d+)\/([^?]+)/.exec(MYSQL.url);
+  if (!m) throw new Error(`CHECKPOINT_JDBC_URL 解析失败: ${MYSQL.url}`);
+  const conn = await mysql.createConnection({
+    host: m[1], port: Number(m[2]), database: m[3],
+    user: MYSQL.user, password: MYSQL.pass, multipleStatements: true,
+  });
+  try {
+    const [rows] = await conn.query(sql);
+    return JSON.stringify(rows);
+  } finally {
+    await conn.end();
+  }
+}
+
+async function dockerMySql(sql) {
   if (DRIVER === 'k8s') {
     // K8s 模式：经本地 mysql 客户端连 oaf-mysql 的 port-forward（startRuntime 已建立）
     return execSync(
@@ -73,11 +90,7 @@ function dockerMySql(sql) {
       { encoding: 'utf8', input: sql },
     );
   }
-  // e2e 默认走 e2e-mysql 容器（AF 同款编排）；SQL 经 stdin 传入避免引号转义
-  return execSync(
-    `docker exec -i e2e-mysql sh -c 'mysql -u${MYSQL.user} -p${MYSQL.pass} agent_framework_dsh' 2>/dev/null`,
-    { encoding: 'utf8', input: sql },
-  );
+  return dbQuery(sql);
 }
 
 async function getJson(pathname) {
@@ -245,8 +258,8 @@ function stopRuntime(_handle) {
 }
 
 async function mysqlCount(table, where = '') {
-  const out = dockerMySql(`SELECT COUNT(*) AS c FROM ${table} ${where}`);
-  return Number(out.match(/(\d+)\s*$/)?.[1] ?? -1);
+  const out = await dockerMySql(`SELECT COUNT(*) AS c FROM ${table} ${where}`);
+  return Number(out.match(/(\d+)/)?.[1] ?? -1);
 }
 
 // ─── 主流程 ───────────────────────────────────────────────────────────────
@@ -270,7 +283,7 @@ try {
   // 2. 清库（全新会话状态）；k8s 模式先建 oaf-mysql 本地转发（断言查询通道）
   if (DRIVER === 'k8s') await ensureK8sMySqlForward();
   for (const t of ['session_event', 'session_user', 'dsh_session_log', 'dsh_session_header']) {
-    try { dockerMySql(`TRUNCATE ${t}`); } catch { /* 表未建（首跑）时由迁移自举 */ }
+    try { await dockerMySql(`TRUNCATE ${t}`); } catch { /* 表未建（首跑）时由迁移自举 */ }
   }
 
   // 3. 起 dsh 运行时
@@ -355,9 +368,10 @@ try {
   });
   check('空请求体 → 400', noMsg.status === 400);
   const files = await fetch(`${BASE}/threads/chat`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ fileIds: ['x'] }),
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ fileIds: ['不存在的id'] }),
   });
-  check('fileIds → 400（M1 前声明边界）', files.status === 400);
+  // M1 已落地：fileIds 物化失败不阻断（该 id 无 file_asset 行 → 降级为纯文本 turn 正常完成）
+  check('fileIds 未知 id 容错（M1 物化降级）', files.status === 200);
 
   // 3.8 冷恢复：杀运行时 → 重启 → 同 sessionId 续聊（C10+C11 持久化语义；
   //     k8s 驱动 = Pod 强杀由 Deployment 重建，即真实故障接管路径）
