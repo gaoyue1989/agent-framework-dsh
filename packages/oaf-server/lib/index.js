@@ -463,6 +463,25 @@ class OafServerService extends Service {
       },
     });
 
+    // A2A agent-card 发现端点（平台注册链路 asyncWaitAndRegister 的拉取源，C19）。
+    // 最小 card：宽松解析字段齐全即可（name/version/description/protocolVersion/skills/capabilities）；
+    // M2 起按 OAF frontmatter 的 skills/mcpServers 声明补全 skills 数组。
+    register({
+      kind: 'exact',
+      path: '/.well-known/agent-card.json',
+      handler: async (req, res) => {
+        this.json(res, 200, {
+          name: cfg.agentName,
+          version: cfg.version,
+          description: cfg.description,
+          protocolVersion: '1.0.0',
+          url: '',
+          skills: [],
+          capabilities: { streaming: true },
+        });
+      },
+    });
+
     // 唯一对话入口：POST /threads/chat（sessionId 入 body，AF 契约）
     register({
       kind: 'exact',
