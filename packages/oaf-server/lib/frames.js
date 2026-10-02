@@ -27,6 +27,14 @@ export function createTurnSerializer({ sessionId, turn, agentName = 'assistant' 
     liveToolCalls: new Set(),
     /** 已发过 TOOL_CALL_END 的 toolCallId（块收口与结算兜底只发一次）。 */
     endedToolCalls: new Set(),
+    /** 已发过 tool_call_summary 的 callId（每调用一次）。 */
+    summarizedCalls: new Set(),
+    /** callId → 原始参数 JSON 串（tool/call 结算登记，摘要生成用）。 */
+    toolArgs: new Map(),
+    /** HITL 恢复段需补发「执行 X」兜底摘要的 callId 集合（服务器注入）。 */
+    resumeSummaries: new Set(),
+    /** 被人工拒绝的 callId → TOOL_RESULT_END 用 DENIED 态。 */
+    deniedCalls: new Set(),
     /** callId → 工具名（tool/call 结算或活流 delta 首帧登记；tool/result 取名用）。 */
     toolNames: new Map(),
   };
@@ -154,41 +162,98 @@ export function settledEventFrames(s, event) {
     }
     case 'tool/call': {
       s.toolNames.set(d.callId, d.name);
+      s.toolArgs.set(d.callId, String(d.arguments ?? ''));
+      const callSummaryFrames = summaryFrames(s, d.callId, d.name);
       if (s.liveToolCalls.has(d.callId)) {
         // 活流已发 START；若块收口未发 END（无 block-end 的网关形态）在此兜底一次
         if (!s.endedToolCalls.has(d.callId)) {
           s.endedToolCalls.add(d.callId);
-          return [{ type: 'TOOL_CALL_END', toolCallId: d.callId, toolCallName: d.name }];
+          return [{ type: 'TOOL_CALL_END', toolCallId: d.callId, toolCallName: d.name }, ...callSummaryFrames];
         }
-        return [];
+        return callSummaryFrames;
       }
       // 结算兜底路径（冷恢复/无活流）：START+END 成对、参数完整
       s.endedToolCalls.add(d.callId);
       return [
         { type: 'TOOL_CALL_START', toolName: d.name, toolCallId: d.callId, replyId },
         { type: 'TOOL_CALL_END', toolCallId: d.callId, toolCallName: d.name },
+        ...callSummaryFrames,
       ];
     }
     case 'tool/result': {
       const callId = d.message?.toolCallId;
       const toolName = s.toolNames.get(callId) ?? 'tool';
       const text = textOfBlocks(d.message?.content);
+      // HITL 恢复段兜底：RESULT_END 前补发「执行 X」摘要（api-frontend-sse §9.6）
+      const fallback = s.resumeSummaries.has(callId) && !s.summarizedCalls.has(`resume:${callId}`)
+        ? [{ type: 'tool_call_summary', toolCallId: callId, toolName, summary: `执行 ${toolName}`, replyId }]
+        : [];
+      if (fallback.length) s.summarizedCalls.add(`resume:${callId}`);
+      const denied = s.deniedCalls.has(callId);
       return [
         { type: 'TOOL_RESULT_START', toolCallId: callId, toolCallName: toolName, replyId },
+        ...fallback,
         ...(text ? [{ type: 'TOOL_RESULT_TEXT_DELTA', delta: text, toolCallId: callId, toolCallName: toolName, replyId }] : []),
         {
           type: 'TOOL_RESULT_END',
-          state: d.message?.isError ? 'ERROR' : 'SUCCESS',
+          state: denied ? 'DENIED' : (d.message?.isError ? 'ERROR' : 'SUCCESS'),
           toolCallId: callId,
           toolCallName: toolName,
           replyId,
         },
+        // 结果预览（人可读，紧随 RESULT_END）
+        { type: 'tool_result_preview', toolCallId: callId, toolName, preview: previewText(text), replyId },
       ];
     }
     case 'turn/end':
       return [{ type: 'AGENT_END', replyId }];
     default:
       return []; // user/message / request/header / system/message 等不出 AF 帧
+  }
+}
+
+/** 解析 tool/call 原始参数 JSON（容错）。 */
+function parseArgs(raw) {
+  try { const v = JSON.parse(raw); return typeof v === 'object' && v !== null ? v : {}; } catch { return {}; }
+}
+
+/** 人可读结果预览：首行截断（AF ToolResultPreview 对位）。 */
+export function previewText(text) {
+  const firstLine = String(text ?? '').split('\n').find((l) => l.trim()) ?? '';
+  return firstLine.slice(0, 120);
+}
+
+/** tool_call_summary 合成（每调用一次；echo 有专属文案契约，其余 `执行 X`）。 */
+function summaryFrames(s, callId, toolName) {
+  if (s.summarizedCalls.has(callId)) return [];
+  s.summarizedCalls.add(callId);
+  const args = parseArgs(s.toolArgs.get(callId) ?? '');
+  return [{
+    type: 'tool_call_summary',
+    toolCallId: callId,
+    toolName,
+    summary: summarizeCall(toolName, args),
+    replyId: s.replyId,
+  }];
+}
+
+/** 工具摘要文案（AF ToolSummaryGenerator 对位；S4 契约钉 echo 文案）。 */
+export function summarizeCall(toolName, args) {
+  switch (toolName) {
+    case 'echo':
+      return `echo ${String(args?.text ?? '').slice(0, 60)}`;
+    case 'present_file':
+      return `交付 ${String(args?.file_path ?? '')}`;
+    case 'present_url':
+      return `登记外部交付 ${String(args?.file_name ?? '')}`;
+    case 'read_file':
+      return `读取 ${String(args?.path ?? args?.file_path ?? '')}`;
+    case 'write_file':
+      return `写入 ${String(args?.path ?? '')}`;
+    case 'get_current_time':
+      return `查询当前时间${args?.timezone ? `（${args.timezone}）` : ''}`;
+    default:
+      return `执行 ${toolName}`;
   }
 }
 

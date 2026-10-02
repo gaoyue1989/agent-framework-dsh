@@ -17,6 +17,7 @@
     "@oaf/oaf-common": "workspace:*",
     "@oaf/oaf-loader": "workspace:*",
     "@oaf/oaf-mysql-persistence": "workspace:*",
-    "@oaf/oaf-server": "workspace:*"
+    "@oaf/oaf-server": "workspace:*",
+    "@oaf/oaf-tools": "workspace:*"
   }
 }

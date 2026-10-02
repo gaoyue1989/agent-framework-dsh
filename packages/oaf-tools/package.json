@@ -1,0 +1,21 @@
+{
+  "name": "@oaf/oaf-tools",
+  "version": "0.1.0-m0",
+  "description": "AF 自定义工具对位（@Tool 注解等价）：echo / get_current_time / present_file / present_url",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/index.js"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@deepseek-ai/cordis": "~4.0.4",
+    "@deepseek-ai/dsh-tools": "0.2.0-rc.2",
+    "@deepseek-ai/schemastery": "~3.18.4",
+    "@oaf/oaf-common": "workspace:*"
+  }
+}

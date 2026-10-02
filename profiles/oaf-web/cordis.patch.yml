@@ -78,10 +78,14 @@
         waitingFrameIntervalSeconds: 15
         heartbeatIntervalSeconds: 20
 
-# ── OAF 包加载（C4 最小版）：AGENTS.md 提示词 + mcp-configs MCP 桥 + ask 工具安全降级 ──
+# ── OAF 包加载（C4）：AGENTS.md 提示词 + mcp-configs MCP 桥 + 权限/ui/skills 元数据 ──
 - insert:
     - id: oaf-loader
       name: '@oaf/oaf-loader'
       config:
         configDir: !!js "process.env.AGENT_CONFIG_DIR ?? '/config'"
-        askDeny: true
+
+# ── AF 自定义工具对位：echo / get_current_time / present_file / present_url ──
+- insert:
+    - id: oaf-tools
+      name: '@oaf/oaf-tools'

@@ -1,40 +1,44 @@
 /**
- * OAF 对外面插件（C1/C2/C3，设计 §5.1/§5.2）——全部 AF HTTP 端点注册在 dsh-host-webserver。
+ * OAF 对外面插件（C1/C2/C3/C6/C12）——与 agent-framework 对外 API 契约对齐
+ * （api-frontend-sse.md / api-thread-spec / e2e api-core 套件为验收基准）。
  *
- * M0 范围：POST /threads/chat（单次流 SSE，AF 帧词表）、GET /threads/{sid}/subscribe
- * （断连续传/回放 + done）、GET /threads/{sid}/status（五态，M0 覆盖 idle/working/completed/
- * interrupted）、GET /threads、PATCH /threads/{sid}（title）、GET /health、GET /。
+ * 端点全景（本文件实现）：
+ * - 对话：POST /threads/chat（单次流 SSE）、GET /threads/{sid}/subscribe、/status
+ * - 会话：GET /threads、GET /threads/{sid}、PATCH /threads/{sid}（title/model）、
+ *   DELETE /threads/{sid}（级联清理）、GET /threads/{sid}/history、/llm-calls
+ * - HITL：POST /threads/{sid}/confirm、/confirm-stream（approval 接缝桥接，H1-H6）
+ * - 文件：POST /files/upload、GET /files/{fileId}（校验矩阵 / inline / RFC5987 / 代理回源）
+ * - 元数据：/、/health、/metadata、/system-prompt、/.well-known/agent-card.json、
+ *   /tools（includeInternal）、/mcp、/skills
  *
- * 架构对位（与 agent-framework 同构）：
- * - 事件镜像（MySQL session_event 表）↔ AF SessionEventStore：帧持久化 + seq 游标，
- *   /subscribe 任意副本可回放（M2 按设计迁 Redis Streams）
- * - 进程内 turn 租约 + waiting 帧 ↔ AF TurnLeaseStore（跨副本 Redis 租约列入 M2）
- * - ctx.agents.create/resume + followup ↔ AF AgentRuntimeService（协议驱动范式，§4.3）
- * - session/event + agent/assistant-stream 监听 ↔ AF AgentEventSseSerializer（帧映射在 frames.js）
- *
- * 已知 M0 边界（诚实清单）：error/interrupted 控制帧不落镜像（AF 同为控制帧无 seq）；
- * fileIds/HITL/A2A/模型托管面未实现（M1-M3，见 README 路线表）。
+ * 架构对位见各节注释；已知差距见仓库 README（S5 userHeaders 注入、MCP Apps 代理、
+ * A2A JSON-RPC、归档双源 history、models CRUD 等属 M1-M3 后续）。
  *
  * @module @oaf/oaf-server
  */
 import { randomUUID } from 'node:crypto';
 import { Service } from '@deepseek-ai/cordis';
-import z from '@deepseek-ai/schemastery';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
-import { createPool, ensureDatabase, migrate } from '@oaf/oaf-common';
+import { createPool, ensureDatabase, migrate, withTxn } from '@oaf/oaf-common';
 import {
   createTurnSerializer,
   settledEventFrames,
   liveStreamFrames,
   controlFrames,
+  textOfBlocks,
+  summarizeCall,
+  previewText,
 } from './frames.js';
+
+export const name = 'oaf-server';
+/** 服务依赖：webserver（路由）+ agents（协议驱动）+ sessionPersistence（resume/history）+ oafLoader（包元数据）+ oafTools（内置工具）。 */
+export const inject = ['webServer', 'agents', 'sessionPersistence', 'oafLoader', 'oafTools', 'tools'];
 
 const MIGRATIONS = [
   {
     version: 1,
     name: 'oaf-server-v1',
     sql: [
-      // AF session_event 契约（api-frontend-sse.md §14）：seq 为前端游标，PK 保证唯一单调
       `CREATE TABLE IF NOT EXISTS session_event (
          session_id VARCHAR(255) NOT NULL,
          seq BIGINT NOT NULL,
@@ -45,7 +49,6 @@ const MIGRATIONS = [
          PRIMARY KEY (session_id, seq),
          KEY idx_session_created (session_id, created_at)
        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
-      // AF session_user 同构：会话列表按 userId 过滤 + title/model 会话元数据
       `CREATE TABLE IF NOT EXISTS session_user (
          session_id VARCHAR(255) NOT NULL PRIMARY KEY,
          user_id VARCHAR(255) NOT NULL,
@@ -57,6 +60,32 @@ const MIGRATIONS = [
        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
     ],
   },
+  {
+    version: 2,
+    name: 'oaf-server-hitl-v2',
+    sql: [
+      // AF confirm_context 同构：CAS 防重复消费（consumed 0→1）
+      `CREATE TABLE IF NOT EXISTS confirm_context (
+         session_id VARCHAR(255) NOT NULL PRIMARY KEY,
+         tool_calls_json MEDIUMTEXT NOT NULL,
+         reply_id VARCHAR(64) NOT NULL DEFAULT '',
+         decision VARCHAR(16) NOT NULL DEFAULT '',
+         created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+         consumed TINYINT(1) NOT NULL DEFAULT 0
+       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+      // LLM 调用记录（/threads/{sid}/llm-calls 数据源；llm/stream 观测写入）
+      `CREATE TABLE IF NOT EXISTS llm_call (
+         id BIGINT AUTO_INCREMENT PRIMARY KEY,
+         session_id VARCHAR(255) NOT NULL,
+         call_id VARCHAR(64) NOT NULL,
+         model VARCHAR(128) NOT NULL DEFAULT '',
+         request_json MEDIUMTEXT NOT NULL,
+         created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+         KEY idx_session (session_id, created_at)
+       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+      `ALTER TABLE session_user ADD COLUMN title_source VARCHAR(16) NOT NULL DEFAULT ''`,
+    ],
+  },
 ];
 
 const sseHeaders = () => ({
@@ -66,13 +95,13 @@ const sseHeaders = () => ({
   'X-Accel-Buffering': 'no',
 });
 
-/** SSE 写通道：chat 主流与 subscribe 追赶流共用；断连只摘除不终止 turn。 */
+/** SSE 写通道：chat 主流与 subscribe/confirm-stream 追赶流共用；断连只摘除不终止 turn。 */
 class SseWriter {
   constructor(res, heartbeatMs) {
     this.res = res;
     this.alive = true;
-    this.tail = false; // subscribe 追赶流（收尾补 done 帧）
-    this.lastWrittenSeq = 0; // 回放/广播去重游标
+    this.tail = false;
+    this.lastWrittenSeq = 0;
     this.heartbeat = heartbeatMs > 0 ? setInterval(() => this.raw(':hb\n\n'), heartbeatMs) : null;
     this.heartbeat?.unref?.();
   }
@@ -84,21 +113,13 @@ class SseWriter {
 
   raw(text) {
     if (!this.alive) return;
-    try {
-      this.res.write(text);
-    } catch {
-      this.alive = false;
-    }
+    try { this.res.write(text); } catch { this.alive = false; }
   }
 
-  /** 控制帧：无 id: 行（api-frontend-sse.md §9.9）。 */
-  control(frame) {
-    this.raw(`data: ${JSON.stringify(frame)}\n\n`);
-  }
+  control(frame) { this.raw(`data: ${JSON.stringify(frame)}\n\n`); }
 
-  /** 事件帧：id: 行携带 seq 游标（断连续传依据），data.id 为事件 ID（e{seq}）。 */
   event(seq, payload) {
-    if (seq <= this.lastWrittenSeq) return; // 回放后追加减除重复
+    if (seq <= this.lastWrittenSeq) return;
     this.lastWrittenSeq = seq;
     this.raw(`id: ${seq}\ndata: ${JSON.stringify(payload)}\n\n`);
   }
@@ -106,17 +127,14 @@ class SseWriter {
   end() {
     if (!this.alive) return;
     this.detach();
-    try {
-      this.res.end();
-    } catch { /* 客户端已断开 */ }
+    try { this.res.end(); } catch { /* 客户端已断开 */ }
   }
 }
 
-/** 事件镜像（MySQL）——AF SessionEventStore 同构：seq 编号 + 回放 + 最新态查询。 */
+/** 事件镜像（MySQL）——AF SessionEventStore 同构。 */
 class EventMirrorStore {
   constructor(pool) {
     this.pool = pool;
-    /** 进程内 seq 计数（按 session），惰性从流顶端播种——与 AF 语义一致（流是唯一事实来源）。 */
     this.cursors = new Map();
   }
 
@@ -129,7 +147,6 @@ class EventMirrorStore {
     this.cursors.set(sessionId, Number(rows[0]?.max_seq ?? 0));
   }
 
-  /** 追加一帧并返回 seq；payload 为含 data.id 的完整帧 JSON。 */
   async append(sessionId, eventType, replyId, payload) {
     await this.seedCursor(sessionId);
     const seq = this.cursors.get(sessionId) + 1;
@@ -141,7 +158,7 @@ class EventMirrorStore {
     return seq;
   }
 
-  async readAfter(sessionId, afterSeq, limit = 5000) {
+  async readAfter(sessionId, afterSeq, limit = 20000) {
     const [rows] = await this.pool.query(
       'SELECT seq, payload FROM session_event WHERE session_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?',
       [sessionId, afterSeq, Number(limit)],
@@ -155,30 +172,37 @@ class EventMirrorStore {
       [sessionId],
     );
     const row = rows[0];
-    return row
-      ? { seq: Number(row.seq), type: row.event_type, replyId: row.reply_id }
-      : undefined;
+    return row ? { seq: Number(row.seq), type: row.event_type, replyId: row.reply_id } : undefined;
   }
 
-  async upsertSessionUser(sessionId, userId, title = '') {
+  async upsertSessionUser(sessionId, userId) {
     await this.pool.query(
-      `INSERT INTO session_user (session_id, user_id, title) VALUES (?, ?, ?)
+      `INSERT INTO session_user (session_id, user_id) VALUES (?, ?)
        ON DUPLICATE KEY UPDATE user_id = VALUES(user_id), updated_at = CURRENT_TIMESTAMP(3)`,
-      [sessionId, userId, title],
+      [sessionId, userId],
     );
   }
 
-  async renameSession(sessionId, title) {
+  async renameSession(sessionId, title, source) {
     await this.pool.query(
-      'UPDATE session_user SET title = ?, updated_at = CURRENT_TIMESTAMP(3) WHERE session_id = ?',
-      [title, sessionId],
+      'UPDATE session_user SET title = ?, title_source = ?, updated_at = CURRENT_TIMESTAMP(3) WHERE session_id = ?',
+      [title, source ?? 'manual', sessionId],
     );
+  }
+
+  async getSessionUser(sessionId) {
+    const [rows] = await this.pool.query(
+      'SELECT session_id, user_id, title, title_source, updated_at FROM session_user WHERE session_id = ?',
+      [sessionId],
+    );
+    return rows[0];
   }
 
   async listSessions(userId) {
+    const filtered = Boolean(userId);
     const [rows] = await this.pool.query(
-      'SELECT session_id, user_id, title, updated_at FROM session_user WHERE user_id = ? ORDER BY updated_at DESC LIMIT 200',
-      [userId],
+      `SELECT session_id, user_id, title, updated_at FROM session_user ${filtered ? 'WHERE user_id = ?' : ''} ORDER BY updated_at DESC LIMIT 200`,
+      filtered ? [userId] : [],
     );
     return rows.map((r) => ({
       session_id: r.session_id,
@@ -190,77 +214,98 @@ class EventMirrorStore {
       updated_at: r.updated_at,
     }));
   }
+
+  async deleteSession(sessionId) {
+    await withTxn(this.pool, async (conn) => {
+      for (const t of ['session_event', 'session_user', 'confirm_context', 'llm_call', 'file_asset']) {
+        await conn.query(`DELETE FROM ${t} WHERE session_id = ?`, [sessionId]);
+      }
+      await conn.query('DELETE FROM dsh_session_log WHERE session_id = ?', [sessionId]);
+      await conn.query('DELETE FROM dsh_session_header WHERE session_id = ?', [sessionId]);
+    });
+    this.cursors.delete(sessionId);
+  }
+}
+
+/** 上传校验（AF F8 矩阵：扩展名黑名单 / MIME 白名单 / 大小 / 空文件）。 */
+const DANGEROUS_EXT = new Set(['exe', 'bat', 'cmd', 'ps1', 'vbs', 'js', 'wsf', 'msi', 'scr', 'com', 'dll', 'sys', 'reg', 'inf', 'hta', 'cpl', 'msp', 'mst']);
+const MIME_RULES = [
+  { test: (m) => m.startsWith('image/'), exts: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg'] },
+  { test: (m) => m.startsWith('text/'), exts: ['txt', 'md', 'csv', 'html', 'htm', 'json', 'xml', 'yaml', 'yml', 'log'] },
+  { test: (m) => m === 'application/pdf', exts: ['pdf'] },
+  { test: (m) => m.includes('openxmlformats') || m.startsWith('application/vnd.ms-'), exts: ['xlsx', 'docx', 'pptx', 'xls', 'doc', 'ppt'] },
+];
+const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
+
+export function validateUpload(fileName, mime, size) {
+  if (size === 0) return { status: 400, error: 'no_file_uploaded' };
+  if (size > MAX_UPLOAD_BYTES) return { status: 413, error: 'file_too_large' };
+  const ext = fileName.split('.').pop()?.toLowerCase() ?? '';
+  if (DANGEROUS_EXT.has(ext)) return { status: 400, error: 'extension_mime_mismatch' };
+  const allowed = MIME_RULES.some((r) => r.test(mime));
+  if (!allowed) return { status: 415, error: 'unsupported_file_type' };
+  const rule = MIME_RULES.find((r) => r.test(mime));
+  if (!rule.exts.includes(ext)) return { status: 400, error: 'extension_mime_mismatch' };
+  return null;
 }
 
 /**
- * OAF 对外面服务：路由表 + 会话运行时（进程内）+ 全局事件监听。
- * 表迁移在 [Service.init]（激活期 await，失败即启动失败）；路由在初始化完成后挂载。
+ * OAF 对外面服务。
  */
 class OafServerService extends Service {
-  /** 类插件服务依赖：webserver（路由落点）+ agents（协议驱动）+ sessionPersistence（resume 判定）。 */
-  static inject = ['webServer', 'agents', 'sessionPersistence'];
-  static Config = z.object({
-    agentName: z.string().default('oaf-dsh-agent'),
-    slug: z.string().default('oaf-dsh-agent'),
-    version: z.string().default('1.0.0'),
-    description: z.string().default(''),
-    engine: z.string().default('DeepSeek Harness (dsh)'),
-    systemProvider: z.string().default('oaf-system'),
-    systemModel: z.string().default(''),
-    defaultUserId: z.string().default('debug-user'),
-    queueTimeoutSeconds: z.number().default(120),
-    waitingFrameIntervalSeconds: z.number().default(15),
-    heartbeatIntervalSeconds: z.number().default(20),
-    jdbcUrl: z.string().default(''),
-    username: z.string().default(''),
-    password: z.string().default(''),
-  });
+  static inject = ['webServer', 'agents', 'sessionPersistence', 'oafLoader', 'oafTools', 'tools'];
 
   constructor(ctx, config) {
     super(ctx, 'oafServer');
-    this.config = config;
+    this.config = { ...OafServerService.defaults(), ...(config ?? {}) };
     this.pool = undefined;
     this.store = undefined;
-    /** sessionId → 会话运行时（活 agent 句柄、租约、开着的 SSE 写通道）。 */
     this.runtimes = new Map();
+    /** HITL 挂起：callId → { resolve(decision), sessionId }。 */
+    this.askPending = new Map();
+    /** file_ready 待_flush 队列：sessionId → asset[]。 */
+    this.fileReadyQueue = new Map();
+    /** UI 代理已确认旁路（一次性）：qualified tool name → true（pre-execute 放行一次）。 */
+    this.uiProxyBypass = new Set();
+    /** 裸名别名透传的内层放行（loader 注册的别名已在裸名层完成审批）。 */
+    this.rawAliasBypass = new Set();
+  }
+
+  static defaults() {
+    return {
+      agentName: process.env.AGENT_NAME ?? 'oaf-dsh-agent',
+      slug: process.env.AGENT_SLUG ?? process.env.AGENT_NAME ?? 'oaf-dsh-agent',
+      version: process.env.AGENT_VERSION ?? '1.0.0',
+      description: process.env.AGENT_DESCRIPTION ?? '',
+      engine: 'DeepSeek Harness (dsh)',
+      systemProvider: process.env.LLM_PROVIDER_ROUTE ?? 'oaf-system',
+      systemModel: process.env.LLM_MODEL_ID ?? '',
+      defaultUserId: 'debug-user',
+      queueTimeoutSeconds: Number(process.env.AGENT_QUEUE_TIMEOUT_SECONDS ?? 120),
+      waitingFrameIntervalSeconds: 15,
+      heartbeatIntervalSeconds: 20,
+    };
   }
 
   async [Service.init]() {
     const cfg = this.config;
-    // 环境变量兜底（CHECKPOINT_* 契约）：patch 未显式给出时回落 env
-    const jdbcUrl = cfg.jdbcUrl || process.env.CHECKPOINT_JDBC_URL;
-    const username = cfg.username || process.env.CHECKPOINT_USERNAME;
-    const password = cfg.password || process.env.CHECKPOINT_PASSWORD;
-    if (!jdbcUrl) throw new Error('oaf-server: 缺少 CHECKPOINT_JDBC_URL（config 或环境变量）');
-    await ensureDatabase({ jdbcUrl, username, password });
-    this.pool = createPool({ jdbcUrl, username, password });
+    const jdbcUrl = process.env.CHECKPOINT_JDBC_URL;
+    if (!jdbcUrl) throw new Error('oaf-server: 缺少 CHECKPOINT_JDBC_URL');
+    const poolOpts = { jdbcUrl, username: process.env.CHECKPOINT_USERNAME, password: process.env.CHECKPOINT_PASSWORD };
+    await ensureDatabase(poolOpts);
+    this.pool = createPool(poolOpts);
     await migrate(this.pool, MIGRATIONS, 'oaf_schema_version_oaf_server');
     this.store = new EventMirrorStore(this.pool);
     this.installListeners();
-    // 路由随服务初始化完成再挂载（请求不会打到未就绪的 store）；注销走 Cordis effect
+    this.installHitlBridge();
+    // 裸名别名（AF 契约名）：MCP client 工具注册完成后兜底执行
+    try {
+      const names = (this.ctx.tools.schemas() ?? []).map((s) => s.name);
+      console.warn('[oaf-server] init 时 registry 工具数 =', names.length, '| mcp 前缀 =', names.filter((n) => n.startsWith('mcp__')).length);
+      const stats = this.ctx.oafLoader.registerRawAliases();
+      console.warn('[oaf-server] 裸名别名注册:', JSON.stringify(stats));
+    } catch (err) { console.error('[oaf-server] 裸名别名注册失败:', err); }
     this.mountRoutes(this.ctx.webServer);
-  }
-
-  /** 全局事件监听（dsh 协议驱动的观测面，dsh-acp 同模式）。 */
-  installListeners() {
-    const disposers = [
-      this.ctx.on('session/event', (session, event) => {
-        this.onSessionEvent(String(session.header.id), event).catch((err) => {
-          console.error('[oaf-server] session/event 处理失败:', err);
-        });
-      }),
-      this.ctx.on('agent/assistant-stream', ({ agent, frame }) => {
-        this.onLiveFrame(String(agent.id), frame).catch((err) => {
-          console.error('[oaf-server] assistant-stream 处理失败:', err);
-        });
-      }),
-      this.ctx.on('agent/error', ({ agent, error }) => {
-        this.onAgentError(String(agent.id), error).catch((err) => {
-          console.error('[oaf-server] agent/error 处理失败:', err);
-        });
-      }),
-    ];
-    this.ctx.effect(() => () => disposers.forEach((d) => d()));
   }
 
   runtimeOf(sessionId) {
@@ -273,8 +318,10 @@ class OafServerService extends Service {
         agent: undefined,
         busy: false,
         turnOpen: false,
+        asking: false,
         turnState: undefined,
         lastReplyId: '',
+        lastAssistantText: '',
         writers: new Set(),
         waiters: [],
         writeChain: undefined,
@@ -284,8 +331,64 @@ class OafServerService extends Service {
     return rt;
   }
 
-  /** 帧发射：镜像持久化（seq 先算后写，payload 带 data.id）→ 全通道广播。
-   *  按 session 串行（writeChain）：seq 分配与写入原子化，帧顺序与事件到达顺序一致。 */
+  installListeners() {
+    const disposers = [
+      this.ctx.on('session/event', (session, event) => {
+        this.onSessionEvent(String(session.header.id), event).catch((err) => console.error('[oaf-server] session/event:', err));
+      }),
+      this.ctx.on('agent/assistant-stream', ({ agent, frame }) => {
+        this.onLiveFrame(String(agent.id), frame).catch((err) => console.error('[oaf-server] assistant-stream:', err));
+      }),
+      this.ctx.on('agent/error', ({ agent, error }) => {
+        this.onAgentError(String(agent.id), error).catch(() => {});
+      }),
+      // 会话标题（dsh session-title 服务产出）→ session_user.title（手动命名 sticky）
+      this.ctx.on('session/title', (session, data) => this.onSessionTitle(String(session?.header?.id ?? ''), data)),
+      // LLM 调用记录（/threads/{sid}/llm-calls 数据源）
+      this.ctx.on('llm/stream', (options, next) => {
+        if (options?.sessionId) {
+          this.pool.query(
+            'INSERT INTO llm_call (session_id, call_id, model, request_json) VALUES (?, ?, ?, ?)',
+            [String(options.sessionId), randomUUID(), String(options.model ?? ''), JSON.stringify({ provider: options.provider ?? '', model: options.model ?? '' }),
+            ]).catch(() => {});
+        }
+        return next();
+      }),
+      // 交付物就绪 → file_ready 帧（在 present_* 工具 post-execute 后 flush，保证帧序在结果之后）
+      this.ctx.on('oaf/file-ready', ({ sessionId, asset }) => {
+        const q = this.fileReadyQueue.get(sessionId) ?? [];
+        q.push(asset);
+        this.fileReadyQueue.set(sessionId, q);
+      }),
+      this.ctx.on('tools/post-execute', async (exec, result, next) => {
+        const out = await next();
+        if (exec?.agent && ['present_file', 'present_url'].includes(exec.name)) {
+          this.flushFileReady(String(exec.agent.id)).catch(() => {});
+        }
+        return out;
+      }),
+    ];
+    this.ctx.effect(() => () => disposers.forEach((d) => d()));
+  }
+
+  async flushFileReady(sessionId) {
+    const q = this.fileReadyQueue.get(sessionId);
+    if (!q?.length) return;
+    this.fileReadyQueue.set(sessionId, []);
+    const rt = this.runtimes.get(sessionId);
+    const frames = q.map((asset) => ({ type: 'file_ready', ...asset }));
+    if (rt) await this.emitEventFrames(rt, frames, rt.turnState?.replyId ?? '');
+  }
+
+  async onSessionTitle(sessionId, data) {
+    if (!sessionId) return;
+    const rt = this.runtimes.get(sessionId);
+    if (rt?.manualTitle) return;
+    const title = String(data?.title ?? '').trim();
+    if (!title) return;
+    await this.store.renameSession(sessionId, title.slice(0, 255), 'auto').catch(() => {});
+  }
+
   emitEventFrames(rt, frames, replyId) {
     const prev = rt.writeChain ?? Promise.resolve();
     const run = prev.then(async () => {
@@ -297,12 +400,7 @@ class OafServerService extends Service {
         for (const w of rt.writers) w.event(seq, payload);
       }
     });
-    rt.writeChain = run.then(
-      () => undefined,
-      (err) => {
-        console.error('[oaf-server] 帧持久化失败:', err);
-      },
-    );
+    rt.writeChain = run.then(() => undefined, (err) => console.error('[oaf-server] 帧持久化失败:', err));
     return run;
   }
 
@@ -314,7 +412,7 @@ class OafServerService extends Service {
       rt.turnState = createTurnSerializer({
         sessionId,
         turn: event.data.turn,
-        agentName: this.config.agentName,
+        agentName: this.loaderAgentName(),
       });
     }
     const s = rt.turnState;
@@ -322,11 +420,15 @@ class OafServerService extends Service {
       const frames = settledEventFrames(s, event);
       if (frames.length) await this.emitEventFrames(rt, frames, s.replyId);
     }
+    if (event.type === 'assistant/message') {
+      const text = textOfBlocks(event.data?.message?.content);
+      if (text) rt.lastAssistantText = text;
+    }
     if (event.type === 'turn/end') {
-      // turn 终点：AGENT_END 已广播；chat 主流直接关，subscribe 追赶流补 done 后关。
-      // M0：aborted/blocked 等 reason 一律按终态关流（HITL 挂起分流列入 M2 hitl-bridge）。
       rt.turnOpen = false;
       rt.lastReplyId = rt.turnState?.replyId ?? rt.lastReplyId;
+      // 标题兜底：dsh session-title 未产出时用首轮助手回复（去尾标点，AF 同款语义）
+      if (!rt.manualTitle) await this.ensureAutoTitle(rt);
       for (const w of [...rt.writers]) {
         if (w.tail) w.control(controlFrames.done());
         w.end();
@@ -334,6 +436,19 @@ class OafServerService extends Service {
       }
       this.releaseLease(rt);
     }
+  }
+
+  async ensureAutoTitle(rt) {
+    const row = await this.store.getSessionUser(rt.sessionId).catch(() => undefined);
+    if (!row || row.title) return;
+    const raw = (rt.lastAssistantText || '').trim();
+    if (!raw) return;
+    const title = raw.replace(/[。！？.!?\s]+$/g, '').slice(0, 60);
+    if (title) await this.store.renameSession(rt.sessionId, title, 'auto').catch(() => {});
+  }
+
+  loaderAgentName() {
+    return this.ctx.oafLoader?.agentName || this.config.agentName;
   }
 
   async onLiveFrame(sessionId, frame) {
@@ -357,7 +472,6 @@ class OafServerService extends Service {
     this.releaseLease(rt);
   }
 
-  /** 进程内 turn 租约：busy 互斥 + FIFO 排队；排队期间向该请求发 waiting 帧（AF C11 单副本面）。 */
   acquireLease(rt, writer, { queueTimeoutMs, waitingFrameMs }) {
     if (!rt.busy) {
       rt.busy = true;
@@ -382,28 +496,24 @@ class OafServerService extends Service {
         writer.end();
         resolve(false);
       }, queueTimeoutMs);
-      waiter.grant = () => {
-        cleanup();
-        resolve(true);
-      };
+      waiter.grant = () => { cleanup(); resolve(true); };
       rt.waiters.push(waiter);
     });
   }
 
   releaseLease(rt) {
     const next = rt.waiters.shift();
-    if (next) next.grant(); // 租约直接移交队头（busy 保持 true）
+    if (next) next.grant();
     else rt.busy = false;
   }
 
-  /** 活 agent 附加：持久会话 resume（冷恢复），否则 create（协议驱动，设计 §4.3）。 */
   async attachAgent(rt) {
     if (rt.agent) return rt.agent;
     const cwd = await this.workspaceFor(rt.sessionId);
     const persisted = await this.ctx.sessionPersistence.stat(rt.sessionId).catch(() => undefined);
-    // 程序化 create/resume 必须显式选模型（provider 路由 + 模型 id）
-    const agentOptions = this.config.systemModel
-      ? { provider: this.config.systemProvider, model: this.config.systemModel }
+    const model = this.config.systemModel || process.env.LLM_MODEL_ID;
+    const agentOptions = model
+      ? { provider: this.config.systemProvider || 'oaf-system', model }
       : undefined;
     const handle = persisted
       ? await this.ctx.agents.resume({ resumeSessionId: rt.sessionId, agentOptions })
@@ -423,109 +533,366 @@ class OafServerService extends Service {
     return dir;
   }
 
+  // ── HITL 桥（C6，H1-H6）：pre-execute ask → approval/request 挂起 → /confirm 恢复 ──
+
+  installHitlBridge() {
+    const loader = () => this.ctx.oafLoader;
+    const isAskTool = (name) => {
+      const l = loader();
+      if (!l) return false;
+      if (l.permission.ask.has(name)) return true;
+      for (const serverName of l.mcpServers) {
+        const prefix = `mcp__${serverName}__`;
+        if (name.startsWith(prefix) && l.permission.ask.has(name.slice(prefix.length))) return true;
+      }
+      return false;
+    };
+    const disposers = [
+      // ask 规则：变更类工具经审批接缝（approval/request）挂起
+      this.ctx.on('tools/pre-execute', async (exec, next) => {
+        if (this.uiProxyBypass.delete(exec.name) || this.rawAliasBypass.delete(exec.name)) return next();
+        if (!isAskTool(exec.name)) return next();
+        return { kind: 'ask', reason: '需要人工确认后执行' };
+      }),
+
+      // 审批应答者：permission_ask 落库 + 帧广播 + 流收口 + 挂起等待 /confirm
+      this.ctx.on('approval/request', async (req, next) => {
+        const sessionId = String(req.agent?.id ?? '');
+        const rt = this.runtimes.get(sessionId);
+        if (!rt) return next();
+        const callId = req.callId ? String(req.callId) : randomUUID();
+        const toolName = String(req.toolName ?? 'tool');
+        const replyId = rt.turnState?.replyId ?? rt.lastReplyId ?? '';
+        // confirm_context 落库（AF CAS：session 唯一挂起行）
+        await this.pool.query(
+          `INSERT INTO confirm_context (session_id, tool_calls_json, reply_id)
+           VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE tool_calls_json = VALUES(tool_calls_json), reply_id = VALUES(reply_id), consumed = 0, decision = ''`,
+          [sessionId, JSON.stringify([{ tool_call_id: callId, name: toolName }]), replyId],
+        ).catch(() => {});
+        // input 从该 turn 已结算的 tool/call 帧取（前端确认卡重建用）
+        const input = await this.lookupToolInput(rt, callId);
+        // permission_ask 帧：持久化 + 广播（api §9.8：带 id 的真实事件帧，客户端 terminal）
+        await this.emitEventFrames(rt, [{
+          type: 'permission_ask',
+          tool_calls: [{ tool_call_id: callId, name: toolName, input }],
+          reply_id: replyId,
+        }], replyId);
+        // 恢复段兜底摘要登记 + 流收口 + 租约让出 + ASKING 态
+        rt.turnState?.resumeSummaries.add(callId);
+        rt.asking = true;
+        for (const w of [...rt.writers]) {
+          w.end();
+          rt.writers.delete(w);
+        }
+        this.releaseLease(rt);
+        const decision = await new Promise((resolve) => {
+          this.askPending.set(callId, {
+            resolve: resolve,
+            sessionId,
+            toolName,
+          });
+        });
+        if (decision === 'denied') rt.turnState?.deniedCalls.add(callId);
+        rt.asking = false;
+        return decision === 'approved' ? 'allowed-once' : 'rejected';
+      }),
+    ];
+    this.ctx.effect(() => () => disposers.forEach((d) => d()));
+  }
+
+  async lookupToolInput(rt, callId) {
+    try {
+      const rows = await this.store.readAfter(rt.sessionId, 0);
+      for (const row of rows) {
+        if (row.payload?.type === 'TOOL_CALL_START' && row.payload.toolCallId === callId) {
+          return row.payload.input ?? {};
+        }
+      }
+    } catch { /* 查不到给空对象 */ }
+    return {};
+  }
+
+  /** confirm_context 消费（CAS）：返回 {ok, row} 或 {error, status}。 */
+  async consumeConfirm(sessionId, results) {
+    const [rows] = await this.pool.query(
+      'SELECT session_id, tool_calls_json, reply_id, consumed FROM confirm_context WHERE session_id = ?',
+      [sessionId],
+    );
+    const row = rows[0];
+    if (!row || Number(row.consumed) === 1) {
+      return row
+        ? { error: 'confirm_already_consumed', status: 409 }
+        : { error: 'confirm_context_not_found', status: 404 };
+    }
+    const calls = JSON.parse(row.tool_calls_json ?? '[]');
+    for (const r of results ?? []) {
+      if (!calls.some((c) => c.tool_call_id === r.tool_call_id)) {
+        return { error: 'confirm_context_not_found', status: 404 };
+      }
+    }
+    const decision = (results ?? []).some((r) => r.confirmed) ? 'approved' : 'denied';
+    const [upd] = await this.pool.query(
+      'UPDATE confirm_context SET consumed = 1, decision = ? WHERE session_id = ? AND consumed = 0',
+      [decision, sessionId],
+    );
+    if (upd.affectedRows === 0) return { error: 'confirm_already_consumed', status: 409 };
+    return { ok: true, row, decision };
+  }
+
+  /** 恢复挂起的审批应答。 */
+  resolveAsk(sessionId, decision) {
+    for (const [callId, pending] of this.askPending) {
+      if (pending.sessionId === sessionId) {
+        this.askPending.delete(callId);
+        pending.resolve(decision);
+      }
+    }
+  }
+
+  // ── history 构建（从 dsh 会话事件日志派生，设计 §4.3 事件溯源）──
+
+  async buildHistory(sessionId) {
+    let events = [];
+    try {
+      const handle = await this.ctx.sessionPersistence.open(sessionId, 'read');
+      try {
+        const { events: evts } = await handle.read(0);
+        events = evts;
+      } finally {
+        await handle.close().catch(() => {});
+      }
+    } catch {
+      events = [];
+    }
+    const messages = [];
+    let pendingCalls = [];
+    const callResultIndex = new Map();
+    for (const event of events) {
+      const d = event.data ?? {};
+      if (event.type === 'user/message') {
+        const text = textOfBlocks(d.content);
+        // 过滤 dsh 合成的运行时上下文快照（非真实用户消息）
+        if (text.startsWith('Current runtime context') || text.includes('Current DSH file policy')) continue;
+        messages.push({ role: 'user', content: text });
+      } else if (event.type === 'tool/call') {
+        pendingCalls.push({ id: d.callId, name: d.name, argsRaw: String(d.arguments ?? '') });
+      } else if (event.type === 'tool/result') {
+        const callId = d.message?.toolCallId;
+        callResultIndex.set(callId, d);
+      } else if (event.type === 'assistant/message') {
+        const toolCalls = pendingCalls.map((c) => {
+          const r = callResultIndex.get(c.id);
+          let args = {};
+          try { args = JSON.parse(c.argsRaw || '{}'); } catch { /* 容错 */ }
+          const outputText = r ? textOfBlocks(r.message?.content) : '';
+          // 拒绝态：审批拒绝（dsh 文案 "the user rejected tool"）或运行时降级拒绝（"已拒绝"）
+          const denied = r?.message?.isError === true && (outputText.includes('the user rejected tool') || outputText.includes('已拒绝'));
+          return { id: c.id, name: c.name, arguments: args, state: r ? (denied ? 'denied' : (r.message?.isError ? 'error' : 'success')) : 'running', output: outputText };
+        });
+        pendingCalls = [];
+        messages.push({ role: 'agent', content: textOfBlocks(d.message?.content), ...(toolCalls.length ? { tool_calls: toolCalls } : {}) });
+      }
+    }
+    if (pendingCalls.length) {
+      for (const c of pendingCalls) {
+        const r = callResultIndex.get(c.id);
+        let args = {};
+        try { args = JSON.parse(c.argsRaw || '{}'); } catch { /* 容错 */ }
+        const outputText = r ? textOfBlocks(r.message?.content) : '';
+        const denied = r?.isError && (outputText.includes('the user rejected tool') || outputText.includes('已拒绝'));
+        messages.push({
+          role: 'agent', content: '',
+          tool_calls: [{ id: c.id, name: c.name, arguments: args, state: r ? (denied ? 'denied' : (r.message?.isError ? 'error' : 'success')) : 'running', output: outputText }],
+        });
+      }
+    }
+    return messages;
+  }
+
+  async pendingConfirmOf(sessionId) {
+    const [rows] = await this.pool.query(
+      'SELECT tool_calls_json, reply_id, created_at, consumed, decision FROM confirm_context WHERE session_id = ?',
+      [sessionId],
+    );
+    const row = rows[0];
+    if (!row || Number(row.consumed) === 1) return null;
+    let calls = [];
+    try { calls = JSON.parse(row.tool_calls_json ?? '[]'); } catch { /* 容错 */ }
+    return {
+      reply_id: row.reply_id ?? '',
+      tools: calls.map((c) => ({ tool_call_id: c.tool_call_id, name: c.name, input: c.input ?? {} })),
+      created_at: row.created_at,
+      source: 'agent_state',
+    };
+  }
+
+  async filesOf(sessionId) {
+    const [rows] = await this.pool.query(
+      "SELECT id, file_name, mime_type, size FROM file_asset WHERE session_id = ? AND origin = 'generated' ORDER BY created_at ASC",
+      [sessionId],
+    );
+    return rows.map((r) => ({ file_id: r.id, file_name: r.file_name, mime_type: r.mime_type, size: Number(r.size) }));
+  }
+
+  // ── 路由 ──
+
   mountRoutes(web) {
     const cfg = this.config;
     const register = (route) => this.ctx.effect(() => web.register(route));
 
-    register({
-      kind: 'exact',
-      path: '/health',
-      handler: async (req, res) => {
-        this.json(res, 200, {
-          status: 'healthy',
-          agent: cfg.agentName,
-          slug: cfg.slug,
-          version: cfg.version,
-          llm_configured: Boolean(process.env.LLM_API_KEY && process.env.LLM_MODEL_ID),
-          engine: cfg.engine,
-          tenant_prefix: cfg.slug,
+    register({ kind: 'exact', path: '/health', handler: async (req, res) => {
+      this.json(res, 200, {
+        status: 'healthy',
+        agent: this.loaderAgentName(),
+        slug: this.ctx.oafLoader?.slug || cfg.slug,
+        version: this.ctx.oafLoader?.frontmatter?.version || cfg.version,
+        llm_configured: Boolean(process.env.LLM_API_KEY && process.env.LLM_MODEL_ID),
+        engine: cfg.engine,
+        tenant_prefix: this.ctx.oafLoader?.slug || cfg.slug,
+      });
+    } });
+
+    register({ kind: 'exact', path: '/', handler: async (req, res) => {
+      this.json(res, 200, {
+        agent: this.loaderAgentName(),
+        slug: this.ctx.oafLoader?.slug || cfg.slug,
+        version: this.ctx.oafLoader?.frontmatter?.version || cfg.version,
+        description: this.ctx.oafLoader?.frontmatter?.description || cfg.description,
+        protocols: { oaf: 'v0.8.0' },
+        engine: cfg.engine,
+        endpoints: {
+          agent_card: '/.well-known/agent-card.json',
+          health: '/health',
+          metadata: '/metadata',
+          threads: '/threads',
+        },
+      });
+    } });
+
+    register({ kind: 'exact', path: '/metadata', handler: async (req, res) => {
+      const loader = this.ctx.oafLoader;
+      let toolNames = [];
+      try { toolNames = (this.ctx.tools.schemas() ?? []).map((s) => s.name); } catch { /* 服务未就绪 */ }
+      const mcpTools = loader?.mcpToolView(toolNames) ?? [];
+      this.json(res, 200, {
+        agent: this.loaderAgentName(),
+        slug: loader?.slug || cfg.slug,
+        version: loader?.frontmatter?.version || cfg.version,
+        description: loader?.frontmatter?.description || cfg.description,
+        protocols: { oaf: 'v0.8.0' },
+        oaf: { tools: mcpTools.map((t) => t.name), skills: loader?.skills?.length ?? 0, mcp: loader?.mcpServers?.length ?? 0, sub_agents: 0 },
+        endpoints: { health: '/health', metadata: '/metadata', threads: '/threads' },
+        engine: cfg.engine,
+      });
+    } });
+
+    register({ kind: 'exact', path: '/system-prompt', handler: async (req, res) => {
+      const loader = this.ctx.oafLoader;
+      this.json(res, 200, { system_prompt: loader?.promptText ?? '', base_prompt: loader?.promptText ?? '' });
+    } });
+
+    register({ kind: 'exact', path: '/.well-known/agent-card.json', handler: async (req, res) => {
+      this.json(res, 200, {
+        name: this.loaderAgentName(),
+        version: this.ctx.oafLoader?.frontmatter?.version || cfg.version,
+        description: this.ctx.oafLoader?.frontmatter?.description || cfg.description,
+        protocolVersion: '1.0.0',
+        url: '',
+        skills: this.ctx.oafLoader?.skills ?? [],
+        capabilities: { streaming: true, a2a: 'A2A-1.0.0' },
+      });
+    } });
+
+    register({ kind: 'exact', path: '/tools', handler: async (req, res) => {
+      const u = new URL(req.url, 'http://x');
+      const includeInternal = u.searchParams.get('includeInternal') === 'true';
+      const loader = this.ctx.oafLoader;
+      let registryNames = [];
+      try { registryNames = (this.ctx.tools.schemas() ?? []).map((s) => s.name); } catch { /* 未就绪 */ }
+      const mcpTools = loader?.mcpToolView(registryNames) ?? [];
+      const visible = mcpTools; // appOnly 工具保留在 /tools 列表并携带标记（仅对 LLM 隐藏）
+      const declared = loader?.frontmatter?.tools ?? null;
+      const INTERNAL_TOOLS = ['echo', 'get_current_time', 'present_file', 'present_url'];
+      const internal = INTERNAL_TOOLS.filter((n) => registryNames.includes(n))
+        .map((n) => ({ name: n, category: 'internal', source: 'builtin', declared: Array.isArray(declared) ? declared.includes(n) : false }));
+      const body = {
+        tools: visible.map(({ qualifiedName, ...rest }) => rest),
+        totalCount: visible.length,
+        mcpCount: visible.filter((t) => !t.appOnly).length,
+        internalCount: includeInternal ? internal.length : 0,
+      };
+      if (includeInternal) {
+        body.tools = [...body.tools, ...internal];
+        body.internalCount = internal.length;
+        body.sdkInternal = registryNames
+          .filter((n) => !n.startsWith('mcp__') && !INTERNAL_TOOLS.includes(n))
+          .map((n) => ({ name: n, category: 'sdk', source: 'sdk' }));
+        body.sdkInternalCount = body.sdkInternal.length;
+      }
+      this.json(res, 200, body);
+    } });
+
+    register({ kind: 'exact', path: '/mcp', handler: async (req, res) => {
+      const loader = this.ctx.oafLoader;
+      let registryNames = [];
+      try { registryNames = (this.ctx.tools.schemas() ?? []).map((s) => s.name); } catch { /* 未就绪 */ }
+      const out = [];
+      for (const [serverName, meta] of loader?.mcpMeta ?? []) {
+        const toolCount = registryNames.filter((n) => n.startsWith(`mcp__${serverName}__`)).length;
+        out.push({
+          server: serverName,
+          vendor: meta.vendor,
+          connection_type: meta.connectionType.toLowerCase(),
+          url: meta.url,
+          tool_count: toolCount,
+          has_ui: Object.keys(meta.uiMap).length > 0,
         });
-      },
-    });
+      }
+      this.json(res, 200, out);
+    } });
 
-    register({
-      kind: 'exact',
-      path: '/',
-      handler: async (req, res) => {
-        this.json(res, 200, {
-          agent: cfg.agentName,
-          slug: cfg.slug,
-          version: cfg.version,
-          description: cfg.description,
-          protocols: { oaf: 'v0.8.0' },
-          engine: cfg.engine,
-          endpoints: {
-            health: '/health',
-            threads: '/threads',
-            threads_chat: '/threads/chat',
-          },
-        });
-      },
-    });
+    register({ kind: 'exact', path: '/skills', handler: async (req, res) => {
+      this.json(res, 200, this.ctx.oafLoader?.skills ?? []);
+    } });
 
-    // A2A agent-card 发现端点（平台注册链路 asyncWaitAndRegister 的拉取源，C19）。
-    // 最小 card：宽松解析字段齐全即可（name/version/description/protocolVersion/skills/capabilities）；
-    // M2 起按 OAF frontmatter 的 skills/mcpServers 声明补全 skills 数组。
-    register({
-      kind: 'exact',
-      path: '/.well-known/agent-card.json',
-      handler: async (req, res) => {
-        this.json(res, 200, {
-          name: cfg.agentName,
-          version: cfg.version,
-          description: cfg.description,
-          protocolVersion: '1.0.0',
-          url: '',
-          skills: [],
-          capabilities: { streaming: true },
-        });
-      },
-    });
+    // 唯一对话入口
+    register({ kind: 'exact', path: '/threads/chat', handler: (req, res) => this.handleChat(req, res) });
 
-    // 唯一对话入口：POST /threads/chat（sessionId 入 body，AF 契约）
-    register({
-      kind: 'exact',
-      path: '/threads/chat',
-      handler: (req, res) => this.handleChat(req, res),
-    });
+    // /threads/{sid}** 子路径路由（confirm/confirm-stream 经由 prefix 表）
+    register({ kind: 'prefix', path: '/threads', handler: async (req, res) => {
+      const sub = req.url.split('?')[0].replace(/^\/threads\/?/, '');
+      const [sidRaw, action] = sub.split('/');
+      const sid = decodeURIComponent(sidRaw ?? '');
+      const u = new URL(req.url, 'http://x');
+      if (!sid) {
+        // /threads 列表（userId 为可选过滤器；缺省 = 全量，AF 同语义）
+        const userId = u.searchParams.get('userId') ?? req.headers['x-user-id']?.toString() ?? '';
+        return this.json(res, 200, await this.store.listSessions(userId));
+      }
+      if (action === 'subscribe' && req.method === 'GET') return this.handleSubscribe(req, res, sid);
+      if (action === 'status' && req.method === 'GET') return this.handleStatus(req, res, sid);
+      if (action === 'history' && req.method === 'GET') return this.handleHistory(req, res, sid);
+      if (action === 'llm-calls' && req.method === 'GET') return this.handleLlmCalls(req, res, sid);
+      if (action === 'confirm' && req.method === 'POST') return this.handleConfirmSync(req, res, sid);
+      if (action === 'confirm-stream' && req.method === 'POST') return this.handleConfirmStream(req, res, sid);
+      if (!action && req.method === 'PATCH') return this.handlePatchThread(req, res, sid);
+      if (!action && req.method === 'GET') return this.handleThreadDetail(req, res, sid);
+      if (!action && req.method === 'DELETE') return this.handleDeleteThread(req, res, sid);
+      return this.json(res, 404, { error: 'not_found' });
+    } });
 
-    register({
-      kind: 'exact',
-      path: '/threads',
-      handler: async (req, res) => {
-        const userId = this.resolveUserId(req, new URL(req.url, 'http://x').searchParams);
-        this.json(res, 200, await this.store.listSessions(userId));
-      },
-    });
+    register({ kind: 'exact', path: '/files/upload', handler: (req, res) => this.handleFileUpload(req, res) });
+    register({ kind: 'prefix', path: '/files', handler: (req, res) => this.handleFileDownload(req, res) });
 
-    // /threads/{sid} 及子路径（subscribe/status/PATCH）
-    register({
-      kind: 'prefix',
-      path: '/threads',
-      handler: async (req, res) => {
-        const sub = req.url.split('?')[0].replace(/^\/threads\/?/, '');
-        const [sidRaw, action] = sub.split('/');
-        const sid = decodeURIComponent(sidRaw ?? '');
-        if (!sid) return this.json(res, 404, { error: 'not_found' });
-        if (action === 'subscribe' && req.method === 'GET') {
-          return this.handleSubscribe(req, res, sid);
-        }
-        if (action === 'status' && req.method === 'GET') return this.handleStatus(req, res, sid);
-        if (!action && req.method === 'PATCH') return this.handlePatchThread(req, res, sid);
-        return this.json(res, 404, { error: 'not_found' });
-      },
-    });
+    // MCP Apps：卡片工具代理（H8 ask 拦截 / M4 app_only 经代理可调）+ 资源占位
+    register({ kind: 'prefix', path: '/mcp', handler: (req, res) => this.handleMcpProxy(req, res) });
   }
 
   resolveUserId(req, params, fallback) {
-    // AF 三来源优先级：X-User-Id header（网关注入）> 请求参数 > body.userId > 默认
-    return req.headers['x-user-id']?.toString()
-      || params.get('userId')
-      || fallback
-      || this.config.defaultUserId;
+    return req.headers['x-user-id']?.toString() || params.get('userId') || fallback || this.config.defaultUserId;
   }
 
-  async readBody(req, limitBytes = 1024 * 1024) {
+  async readBody(req, limitBytes = 32 * 1024 * 1024) {
     const chunks = [];
     let size = 0;
     for await (const chunk of req) {
@@ -533,29 +900,23 @@ class OafServerService extends Service {
       if (size > limitBytes) throw Object.assign(new Error('request body too large'), { statusCode: 413 });
       chunks.push(chunk);
     }
-    const text = Buffer.concat(chunks).toString('utf8');
-    return text ? JSON.parse(text) : {};
+    return Buffer.concat(chunks);
   }
 
-  /** POST /threads/chat —— 单次流 SSE（AF C2）。 */
+  /** POST /threads/chat —— 单次流 SSE（AF C2；ASKING 态拒新 turn，H6）。 */
   async handleChat(req, res) {
-    const cfg = this.config;
     let body;
     try {
-      body = await this.readBody(req);
+      body = JSON.parse((await this.readBody(req, 1024 * 1024)).toString('utf8') || '{}');
     } catch (err) {
       return this.json(res, err.statusCode ?? 400, { error: 'invalid_request' });
     }
-    const userId = this.resolveUserId(req, new URL(req.url, 'http://x').searchParams, body.userId)
-      ?? cfg.defaultUserId;
+    const cfg = this.config;
+    const userId = this.resolveUserId(req, new URL(req.url, 'http://x').searchParams, body.userId) ?? cfg.defaultUserId;
     const message = typeof body.message === 'string' ? body.message : '';
     const fileIds = Array.isArray(body.fileIds) ? body.fileIds : [];
     if (!message && fileIds.length === 0) {
       return this.json(res, 400, { error: 'message_or_fileIds_required' });
-    }
-    if (fileIds.length > 0) {
-      // M0 边界：fileIds 物化（UploadWorkspaceInjector 语义）列入 M1
-      return this.json(res, 400, { error: 'fileIds_not_supported_in_m0' });
     }
     if (body.model && !['', 'system', process.env.LLM_MODEL_ID].includes(body.model)) {
       return this.json(res, 400, { error: 'unknown_model' });
@@ -568,10 +929,16 @@ class OafServerService extends Service {
     res.writeHead(200, sseHeaders());
     const writer = new SseWriter(res, (cfg.heartbeatIntervalSeconds ?? 20) * 1000);
     req.on('close', () => {
-      // 断连只摘除写通道，turn 继续执行（Durable SSE 语义）
       writer.detach();
       rt.writers.delete(writer);
     });
+
+    // H6：ASKING 态拒新 turn（AF turn_pending_confirm 语义）
+    if (rt.asking) {
+      writer.control(controlFrames.error(`turn_pending_confirm: session '${sessionId}' is in ASKING state（先走确认流程再发新消息）`));
+      writer.end();
+      return;
+    }
 
     const ok = await this.acquireLease(rt, writer, {
       queueTimeoutMs: (cfg.queueTimeoutSeconds ?? 120) * 1000,
@@ -584,11 +951,13 @@ class OafServerService extends Service {
     try {
       await this.store.upsertSessionUser(sessionId, userId);
       const agent = await this.attachAgent(rt);
+      // fileIds 注入（F1）：物化进工作区 uploads/ + 消息文本块提及（图片内联走 M1 attachment 管线）
+      const injected = await this.materializeFiles(sessionId, userId, fileIds, await this.workspaceFor(sessionId));
+      const mentions = injected.length ? `\n\n[已注入工作区文件: ${injected.join(', ')}]` : '';
       agent.followup(createUserMessage({
-        content: [{ type: 'text', text: message }],
+        content: [{ type: 'text', text: message + mentions }],
         source: { kind: 'user' },
       }));
-      // settlement 由 turn/end 监听关流（AGENT_END 广播 → writers 清理 → 租约释放）
     } catch (err) {
       writer.control(controlFrames.error(err instanceof Error ? err.message : String(err)));
       writer.end();
@@ -598,8 +967,26 @@ class OafServerService extends Service {
     }
   }
 
-  /** GET /threads/{sid}/subscribe —— 回放 + 追加/收尾（AF C3 durable SSE）。 */
-  async handleSubscribe(req, res, sessionId) {
+  /** fileIds → 工作区物化（AF UploadWorkspaceInjector 语义的本地档）。 */
+  async materializeFiles(sessionId, userId, fileIds, workspaceDir) {
+    if (!fileIds?.length) return [];
+    const { copyFileSync, mkdirSync } = await import('node:fs');
+    const path = await import('node:path');
+    const injected = [];
+    const destDir = path.join(workspaceDir, 'uploads');
+    mkdirSync(destDir, { recursive: true });
+    const root = process.env.OAF_FILES_DIR ?? '/tmp/oaf-dsh-files';
+    for (const fileId of fileIds) {
+      const [rows] = await this.pool.query('SELECT file_name, storage_type, storage_key FROM file_asset WHERE id = ?', [String(fileId)]);
+      const row = rows[0];
+      if (!row || row.storage_type !== 'local') continue;
+      copyFileSync(path.join(root, row.storage_key), path.join(destDir, row.file_name));
+      injected.push(`uploads/${row.file_name}`);
+    }
+    return injected;
+  }
+
+  handleSubscribe(req, res, sessionId) {
     const u = new URL(req.url, 'http://x');
     const afterSeq = Number(u.searchParams.get('afterSeq') ?? 0) || 0;
     res.writeHead(200, sseHeaders());
@@ -610,70 +997,350 @@ class OafServerService extends Service {
       this.runtimes.get(sessionId)?.writers.delete(writer);
     });
     const rt = this.runtimes.get(sessionId);
-    const active = Boolean(rt && (rt.busy || rt.turnOpen));
-    // 先挂通道再回放：回放与广播的竞态由 writer.lastWrittenSeq 去重
+    const active = Boolean(rt && (rt.busy || rt.turnOpen || rt.asking));
     if (active) rt.writers.add(writer);
-    try {
+    (async () => {
       const rows = await this.store.readAfter(sessionId, afterSeq);
       for (const row of rows) writer.event(row.seq, row.payload);
       if (!active) {
         writer.control(controlFrames.done());
         writer.end();
       }
-    } catch (err) {
-      writer.control(controlFrames.error(err instanceof Error ? err.message : String(err)));
+    })().catch((err) => {
+      writer.control(controlFrames.error(err.message));
       writer.end();
-    }
-  }
-
-  /** GET /threads/{sid}/status —— 五态裁决（AF C3；interrupted = 有事件但无租约无确认）。 */
-  async handleStatus(req, res, sessionId) {
-    const latest = await this.store.latest(sessionId);
-    if (!latest) {
-      return this.json(res, 200, {
-        session_id: sessionId,
-        state: 'idle',
-        latest_event_seq: 0,
-        reply_id: '',
-        pending_confirm: '',
-      });
-    }
-    const rt = this.runtimes.get(sessionId);
-    const active = Boolean(rt && (rt.busy || rt.turnOpen));
-    const state = active ? 'working' : (latest.type === 'AGENT_END' ? 'completed' : 'interrupted');
-    this.json(res, 200, {
-      session_id: sessionId,
-      state,
-      latest_event_seq: latest.seq,
-      reply_id: rt?.turnState?.replyId ?? latest.replyId ?? '',
-      pending_confirm: '',
     });
   }
 
-  /** PATCH /threads/{sid} —— title 重命名（model 会话绑定列入 M3 模型面）。 */
+  async handleStatus(req, res, sessionId) {
+    const pending = await this.pendingConfirmOf(sessionId).catch(() => null);
+    const latest = await this.store.latest(sessionId).catch(() => undefined);
+    const rt = this.runtimes.get(sessionId);
+    if (!latest && !pending) {
+      return this.json(res, 200, { session_id: sessionId, state: 'idle', latest_event_seq: 0, reply_id: '', pending_confirm: '' });
+    }
+    const active = Boolean(rt && (rt.busy || rt.turnOpen));
+    const state = pending ? 'waiting_confirm' : (active ? 'working' : (latest?.type === 'AGENT_END' ? 'completed' : (latest ? 'interrupted' : 'idle')));
+    this.json(res, 200, {
+      session_id: sessionId,
+      state,
+      latest_event_seq: latest?.seq ?? 0,
+      reply_id: rt?.turnState?.replyId ?? latest?.replyId ?? '',
+      pending_confirm: pending ?? '',
+    });
+  }
+
+  async handleHistory(req, res, sessionId) {
+    const messages = await this.buildHistory(sessionId);
+    const pendingConfirm = await this.pendingConfirmOf(sessionId).catch(() => null);
+    const files = await this.filesOf(sessionId).catch(() => []);
+    this.json(res, 200, { session_id: sessionId, pendingConfirm: pendingConfirm ?? null, files, messages });
+  }
+
+  async handleThreadDetail(req, res, sessionId) {
+    const row = await this.store.getSessionUser(sessionId).catch(() => undefined);
+    if (!row) return this.json(res, 200, { session_id: sessionId, user_id: '', updated_at: null, pendingConfirm: null, files: [], messages: [] });
+    const messages = await this.buildHistory(sessionId);
+    const pendingConfirm = await this.pendingConfirmOf(sessionId).catch(() => null);
+    const files = await this.filesOf(sessionId).catch(() => []);
+    this.json(res, 200, {
+      session_id: sessionId,
+      user_id: row.user_id,
+      updated_at: row.updated_at,
+      pendingConfirm: pendingConfirm ?? null,
+      files,
+      messages,
+    });
+  }
+
+  async handleDeleteThread(req, res, sessionId) {
+    const rt = this.runtimes.get(sessionId);
+    if (rt?.handle) await rt.handle.dispose().catch(() => {});
+    this.runtimes.delete(sessionId);
+    await this.store.deleteSession(sessionId).catch(() => {});
+    this.json(res, 200, { session_id: sessionId, deleted: true });
+  }
+
   async handlePatchThread(req, res, sessionId) {
     let body;
     try {
-      body = await this.readBody(req);
+      body = JSON.parse((await this.readBody(req, 1024 * 1024)).toString('utf8') || '{}');
     } catch {
       return this.json(res, 400, { error: 'invalid_request' });
     }
+    const rt = this.runtimes.get(sessionId);
     if (body.title !== undefined) {
       if (typeof body.title !== 'string' || body.title.length === 0) {
         return this.json(res, 400, { error: 'invalid_title' });
       }
-      await this.store.renameSession(sessionId, body.title.slice(0, 255));
+      await this.store.renameSession(sessionId, body.title.slice(0, 255), 'manual');
+      if (rt) rt.manualTitle = true;
     }
     if (body.model !== undefined && !['', 'system', process.env.LLM_MODEL_ID].includes(body.model)) {
       return this.json(res, 400, { error: 'unknown_model' });
     }
-    this.json(res, 200, { session_id: sessionId, title: body.title ?? '' });
+    const row = await this.store.getSessionUser(sessionId).catch(() => undefined);
+    this.json(res, 200, { session_id: sessionId, title: row?.title ?? body.title ?? '' });
+  }
+
+  async handleLlmCalls(req, res, sessionId) {
+    const [rows] = await this.pool.query(
+      'SELECT call_id, model, request_json, created_at FROM llm_call WHERE session_id = ? ORDER BY id ASC LIMIT 500',
+      [sessionId],
+    );
+    this.json(res, 200, {
+      session_id: sessionId,
+      calls: rows.map((r) => ({ call_id: r.call_id, timestamp: r.created_at, model: r.model, request: r.request_json })),
+    });
+  }
+
+  // ── HITL 确认双端点 ──
+
+  parseConfirmBody(req) {
+    return this.readBody(req, 1024 * 1024).then((buf) => JSON.parse(buf.toString('utf8') || '{}'));
+  }
+
+  async handleConfirmSync(req, res, sessionId) {
+    let body;
+    try {
+      body = await this.parseConfirmBody(req);
+    } catch {
+      return this.json(res, 400, { error: 'invalid_request' });
+    }
+    const verdict = await this.consumeConfirm(sessionId, body.results);
+    if (verdict.error) return this.json(res, verdict.status, { error: verdict.error });
+    const rt = this.runtimes.get(sessionId);
+    this.resolveAsk(sessionId, verdict.decision);
+    // 同步确认：等 turn 收敛，返回最终回复（AF §3.1）
+    const deadline = Date.now() + 120_000;
+    while (Date.now() < deadline) {
+      const stillOpen = rt && (rt.turnOpen || rt.busy);
+      if (!stillOpen) break;
+      await new Promise((r) => setTimeout(r, 300));
+    }
+    const finalText = rt?.lastAssistantText ?? '';
+    this.json(res, 200, { response: finalText, thread_id: sessionId });
+  }
+
+  async handleConfirmStream(req, res, sessionId) {
+    let body;
+    try {
+      body = await this.parseConfirmBody(req);
+    } catch {
+      return this.json(res, 400, { error: 'invalid_request' });
+    }
+    res.writeHead(200, sseHeaders());
+    const writer = new SseWriter(res, (this.config.heartbeatIntervalSeconds ?? 20) * 1000);
+    req.on('close', () => {
+      writer.detach();
+      this.runtimes.get(sessionId)?.writers.delete(writer);
+    });
+    const verdict = await this.consumeConfirm(sessionId, body.results);
+    if (verdict.error) {
+      writer.control(controlFrames.error(verdict.error === 'confirm_already_consumed'
+        ? `confirm_already_consumed: session '${sessionId}' 的确认上下文已被消费`
+        : `confirm_context_not_found: Session not found or confirm context expired`));
+      writer.end();
+      return;
+    }
+    const rt = this.runtimes.get(sessionId);
+    if (rt) {
+      rt.writers.add(writer);
+      this.resolveAsk(sessionId, verdict.decision);
+    } else {
+      writer.control(controlFrames.error(`confirm_context_not_found: Session not found or confirm context expired`));
+      writer.end();
+    }
+  }
+
+  // ── 文件（C12）──
+
+  async handleFileUpload(req, res) {
+    const ct = req.headers['content-type'] ?? '';
+    if (!ct.includes('multipart/form-data')) {
+      return this.json(res, 400, { error: 'no_file_uploaded' });
+    }
+    const m = /boundary=(?:"([^"]+)"|([^;]+))/i.exec(ct);
+    if (!m) return this.json(res, 400, { error: 'no_file_uploaded' });
+    const boundary = Buffer.from(`--${m[1] ?? m[2]}`);
+    const body = await this.readBody(req);
+    // Buffer 级 multipart 解析：文件名字段按 UTF-8 解码（中文 RFC5987 契约）、内容保持原始字节
+    let fileName = '';
+    let mime = '';
+    let content = null;
+    let userId = '';
+    let sessionId = '';
+    let pos = body.indexOf(boundary);
+    while (pos >= 0) {
+      const next = body.indexOf(boundary, pos + boundary.length);
+      if (next < 0) break;
+      const part = body.subarray(pos + boundary.length, next);
+      const headerEnd = part.indexOf(Buffer.from('\r\n\r\n'));
+      if (headerEnd >= 0) {
+        const headers = part.subarray(0, headerEnd).toString('utf8');
+        const data = part.subarray(headerEnd + 4, part.length - 2); // 去尾部 \r\n
+        const nameMatch = /name="([^"]*)"/.exec(headers);
+        const fileMatch = /filename="([^"]*)"/.exec(headers);
+        const ctMatch = /Content-Type:\s*([^\r\n]+)/i.exec(headers);
+        const field = nameMatch?.[1] ?? '';
+        if (fileMatch) {
+          fileName = fileMatch[1];
+          mime = ctMatch?.[1]?.trim() ?? 'application/octet-stream';
+          content = data;
+        } else if (field === 'userId') {
+          userId = data.toString('utf8');
+        } else if (field === 'sessionId') {
+          sessionId = data.toString('utf8');
+        }
+      }
+      pos = next;
+    }
+    if (!fileName || !content) return this.json(res, 400, { error: 'no_file_uploaded' });
+    try { fileName = decodeURIComponent(fileName); } catch { /* 原样 */ }
+    const bad = validateUpload(fileName, mime, content.length);
+    if (bad) return this.json(res, bad.status, { error: bad.error });
+    const id = randomUUID();
+    const { mkdirSync, writeFileSync } = await import('node:fs');
+    const path = await import('node:path');
+    const root = process.env.OAF_FILES_DIR ?? '/tmp/oaf-dsh-files';
+    mkdirSync(root, { recursive: true });
+    const storageKey = `${id}${fileName.replace(/[^\w.-]/g, '_')}`;
+    writeFileSync(path.join(root, storageKey), content);
+    await this.pool.query(
+      `INSERT INTO file_asset (id, user_key, session_id, file_name, mime_type, size, storage_type, storage_key, origin, status)
+       VALUES (?, ?, ?, ?, ?, ?, 'local', ?, 'upload', 'injected')`,
+      [id, userId, sessionId, fileName, mime, content.length, storageKey],
+    );
+    this.json(res, 200, { file_id: id, file_name: fileName, mime_type: mime, size: content.length });
+  }
+
+  async handleFileDownload(req, res, overrideId) {
+    try {
+      return await this.downloadImpl(req, res, overrideId);
+    } catch (err) {
+      console.error('[oaf-server] file download error:', err);
+      return this.json(res, 500, { error: 'download_failed', message: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
+  async downloadImpl(req, res, overrideId) {
+    const sub = req.url.split('?')[0].replace(/^\/files\/?/, '');
+    const fileId = overrideId ?? decodeURIComponent(sub.split('/')[0] ?? '');
+    if (!/^[0-9a-f-]{36}$/.test(fileId)) return this.json(res, 400, { error: 'invalid_file_id' });
+    const [rows] = await this.pool.query('SELECT file_name, mime_type, storage_type, storage_key, external_url FROM file_asset WHERE id = ?', [fileId]);
+    const row = rows[0];
+    if (!row) return this.json(res, 404, { error: 'file_not_found' });
+    const u = new URL(req.url, 'http://x');
+    const inline = u.searchParams.get('inline') === '1' && /^(image\/|text\/)/.test(row.mime_type);
+    // header 明文部分必须 ASCII 安全（非 ASCII 走 RFC5987 编码段）
+    const asciiName = row.file_name.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_');
+    const encoded = encodeURIComponent(row.file_name).replace(/['()]/g, escape);
+    const disposition = `${inline ? 'inline' : 'attachment'}; filename="${asciiName}"; filename*=UTF-8''${encoded}`;
+    // 外部交付：代理回源（前缀白名单收敛 SSRF，AF FILE_EXTERNAL_URL_PREFIXES 语义）
+    if (row.storage_type === 'external') {
+      const prefixes = (process.env.FILE_EXTERNAL_URL_PREFIXES ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+      if (!prefixes.some((p) => row.external_url.startsWith(p))) {
+        return this.json(res, 403, { error: 'external_url_not_allowed' });
+      }
+      try {
+        const upstream = await fetch(row.external_url);
+        if (!upstream.ok) return this.json(res, 502, { error: 'upstream_fetch_failed' });
+        const buf = Buffer.from(await upstream.arrayBuffer());
+        res.writeHead(200, {
+          'Content-Type': row.mime_type,
+          'Content-Length': buf.length,
+          'Content-Disposition': disposition,
+          'X-Content-Type-Options': 'nosniff',
+        });
+        return res.end(buf);
+      } catch {
+        return this.json(res, 502, { error: 'upstream_fetch_failed' });
+      }
+    }
+    const path = await import('node:path');
+    const root = process.env.OAF_FILES_DIR ?? '/tmp/oaf-dsh-files';
+    const file = path.join(root, row.storage_key);
+    const { statSync, createReadStream } = await import('node:fs');
+    let size;
+    try {
+      size = statSync(file).size;
+    } catch {
+      return this.json(res, 502, { error: 'storage_object_missing' });
+    }
+    res.writeHead(200, {
+      'Content-Type': row.mime_type,
+      'Content-Length': size,
+      'Content-Disposition': disposition,
+      'X-Content-Type-Options': 'nosniff',
+    });
+    createReadStream(file).pipe(res);
+  }
+
+  /** /mcp/{server}/tools/{tool}（POST）与 /mcp/{server}/resources（GET，占位）。 */
+  async handleMcpProxy(req, res) {
+    const sub = req.url.split('?')[0].replace(/^\/mcp\/?/, '');
+    const parts = sub.split('/').map(decodeURIComponent);
+    const [server, action, ...rest] = parts;
+    if (!server) return this.json(res, 404, { error: 'not_found' });
+    const loader = this.ctx.oafLoader;
+    const meta = loader?.mcpMeta.get(server);
+    if (action === 'tools' && rest[0] && req.method === 'POST') {
+      const toolName = rest[0];
+      let body;
+      try {
+        body = JSON.parse((await this.readBody(req, 1024 * 1024)).toString('utf8') || '{}');
+      } catch {
+        return this.json(res, 400, { error: 'invalid_request' });
+      }
+      const qualified = `mcp__${server}__${toolName}`;
+      const isAsk = (() => {
+        if (!loader) return false;
+        if (loader.permission.ask.has(toolName)) return true;
+        return loader.mcpServers.includes(server) && loader.permission.ask.has(toolName);
+      })();
+      // ask 工具未经确认 → 403 needsConfirm（H8 契约）
+      if (isAsk && body.confirmed !== true) {
+        return this.json(res, 403, {
+          needsConfirm: true,
+          toolCalls: [{ tool_call_id: randomUUID(), name: toolName, input: body.arguments ?? {} }],
+        });
+      }
+      if (isAsk) this.uiProxyBypass.add(qualified);
+      try {
+        const result = await this.ctx.tools.execute({
+          callId: randomUUID(),
+          name: qualified,
+          arguments: body.arguments ?? {},
+          signal: new AbortController().signal,
+        });
+        const content = Array.isArray(result?.content)
+          ? result.content
+          : [{ type: 'text', text: String(result?.content ?? result ?? '') }];
+        return this.json(res, 200, { content, isError: Boolean(result?.isError) });
+      } catch (err) {
+        return this.json(res, 200, {
+          content: [{ type: 'text', text: err instanceof Error ? err.message : String(err) }],
+          isError: true,
+        });
+      }
+    }
+    if (action === 'resources' && req.method === 'GET') {
+      // MCP Apps UI 资源代理属 M1-M3（/resources/ui HtmlResource 拉取 + CSP 注入）
+      const ui = meta ? Object.values(meta.uiMap) : [];
+      return this.json(res, 200, { server, resources: ui.map((uri) => `${uri}`) });
+    }
+    return this.json(res, 404, { error: 'not_found' });
   }
 
   json(res, code, body) {
     res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' });
     res.end(JSON.stringify(body));
   }
+}
+
+/** Cordis 插件入口：注册服务（激活期完成迁移/监听/HITL 桥/路由）。 */
+export function apply(ctx, config) {
+  new OafServerService(ctx, config ?? {});
 }
 
 export { OafServerService as default };
