@@ -196,6 +196,8 @@ class OafLoaderService extends Service {
     this.agentName = '';
     this.slug = '';
     this.permission = { allow: new Set(), ask: new Set() };
+    /** 裸名别名透传中的内层放行（qualified 名一次性）：审批已在裸名层完成，内层不再重复 ask。 */
+    this.rawAliasBypass = new Set();
     /** server 名 → 展示元数据（summarizeMcpServer）。 */
     this.mcpMeta = new Map();
     /** 已成功挂载的 dsh-mcp-client server 名。 */
@@ -301,7 +303,7 @@ class OafLoaderService extends Service {
               });
               return { text: JSON.stringify(result ?? {}) };
             }
-            this.rawAliasBypass?.add(q);
+            this.rawAliasBypass.add(q);
             const result = await this.ctx.tools.execute({
               callId: randomUUID(),
               name: q,

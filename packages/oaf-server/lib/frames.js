@@ -13,13 +13,16 @@
  * @module @oaf/oaf-server/frames
  */
 
-/** 创建一个 turn 的序列化状态机（每 turn 一个；turn 事件间共享由调用方保证）。 */
-export function createTurnSerializer({ sessionId, turn, agentName = 'assistant' }) {
+/** 创建一个 turn 的序列化状态机（每 turn 一个；turn 事件间共享由调用方保证）。
+ *  displayToolName：帧面工具名归一（mcp__{server}__tool → 裸名，AF 契约词表），缺省原样。 */
+export function createTurnSerializer({ sessionId, turn, agentName = 'assistant', displayToolName }) {
+  const displayName = displayToolName ?? ((n) => n);
   return {
     sessionId,
     turn,
     replyId: `r${turn}`,
     agentName,
+    displayName,
     blockCounter: 0,
     /** 活流块索引 → { kind, blockId, callId? }（block-start 开、block-end 关）。 */
     openBlocks: new Map(),
@@ -94,7 +97,7 @@ export function liveStreamFrames(s, frame) {
         if (c.name) s.toolNames.set(c.id, c.name);
         frames.push({
           type: 'TOOL_CALL_START',
-          toolName: c.name ?? s.toolNames.get(c.id) ?? 'tool',
+          toolName: displayNameOf(s, c.name) ?? s.toolNames.get(c.id) ?? 'tool',
           toolCallId: c.id,
           replyId,
         });
@@ -103,7 +106,7 @@ export function liveStreamFrames(s, frame) {
       }
       // chunk.index 即块索引：登记 toolCall 块，block-end 据此发对应 callId 的 END
       if (!s.openBlocks.has(c.index)) s.openBlocks.set(c.index, { kind: 'toolCall', callId: c.id });
-      frames.push({ type: 'TOOL_CALL_DELTA', delta: c.argumentsDelta, toolCallId: c.id, toolCallName: s.toolNames.get(c.id) ?? c.name });
+      frames.push({ type: 'TOOL_CALL_DELTA', delta: c.argumentsDelta, toolCallId: c.id, toolCallName: displayNameOf(s, s.toolNames.get(c.id) ?? c.name) });
       return frames;
     }
     case 'block-end': {
@@ -116,7 +119,7 @@ export function liveStreamFrames(s, frame) {
       const callId = open.callId;
       if (callId && !s.endedToolCalls.has(callId)) {
         s.endedToolCalls.add(callId);
-        return [{ type: 'TOOL_CALL_END', toolCallId: callId, toolCallName: s.toolNames.get(callId) }];
+        return [{ type: 'TOOL_CALL_END', toolCallId: callId, toolCallName: displayNameOf(s, s.toolNames.get(callId)) }];
       }
       return [];
     }
@@ -128,6 +131,11 @@ export function liveStreamFrames(s, frame) {
 function findOpenByKind(s, kind) {
   for (const open of s.openBlocks.values()) if (open.kind === kind) return open;
   return undefined;
+}
+
+/** 帧面工具名（mcp__{server}__tool → 裸名，AF 契约；注册别名层已保证等价执行）。 */
+function displayNameOf(s, name) {
+  return name === undefined ? undefined : s.displayName(name);
 }
 
 /**
@@ -163,26 +171,27 @@ export function settledEventFrames(s, event) {
     case 'tool/call': {
       s.toolNames.set(d.callId, d.name);
       s.toolArgs.set(d.callId, String(d.arguments ?? ''));
-      const callSummaryFrames = summaryFrames(s, d.callId, d.name);
+      const shownName = displayNameOf(s, d.name);
+      const callSummaryFrames = summaryFrames(s, d.callId, shownName);
       if (s.liveToolCalls.has(d.callId)) {
         // 活流已发 START；若块收口未发 END（无 block-end 的网关形态）在此兜底一次
         if (!s.endedToolCalls.has(d.callId)) {
           s.endedToolCalls.add(d.callId);
-          return [{ type: 'TOOL_CALL_END', toolCallId: d.callId, toolCallName: d.name }, ...callSummaryFrames];
+          return [{ type: 'TOOL_CALL_END', toolCallId: d.callId, toolCallName: shownName }, ...callSummaryFrames];
         }
         return callSummaryFrames;
       }
       // 结算兜底路径（冷恢复/无活流）：START+END 成对、参数完整
       s.endedToolCalls.add(d.callId);
       return [
-        { type: 'TOOL_CALL_START', toolName: d.name, toolCallId: d.callId, replyId },
-        { type: 'TOOL_CALL_END', toolCallId: d.callId, toolCallName: d.name },
+        { type: 'TOOL_CALL_START', toolName: shownName, toolCallId: d.callId, replyId },
+        { type: 'TOOL_CALL_END', toolCallId: d.callId, toolCallName: shownName },
         ...callSummaryFrames,
       ];
     }
     case 'tool/result': {
       const callId = d.message?.toolCallId;
-      const toolName = s.toolNames.get(callId) ?? 'tool';
+      const toolName = displayNameOf(s, s.toolNames.get(callId)) ?? 'tool';
       const text = textOfBlocks(d.message?.content);
       // HITL 恢复段兜底：RESULT_END 前补发「执行 X」摘要（api-frontend-sse §9.6）
       const fallback = s.resumeSummaries.has(callId) && !s.summarizedCalls.has(`resume:${callId}`)

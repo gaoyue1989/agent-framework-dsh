@@ -192,6 +192,19 @@ try {
   const askTcid = raw.match(/permission_ask[\s\S]*?"tool_call_id":"([^"]+)"/)?.[1];
   check('ask 工具触发 permission_ask 挂起帧（HITL 桥）', Boolean(askFrame) && Boolean(askTcid), askFrame ?? '无 permission_ask');
   check('挂起帧工具名为裸名（AF 契约）', askFrame?.includes('"name":"delete_service"') ?? false);
+  // ask 段帧序（契约 v2，4db16ba+）：permission_ask → REQUEST_STOP → AGENT_RESULT → AGENT_END
+  const idxAsk = raw.indexOf('"type":"permission_ask"');
+  const idxStop = raw.indexOf('"type":"REQUEST_STOP"');
+  const idxResult = raw.indexOf('"type":"AGENT_RESULT"');
+  const idxEnd1 = raw.indexOf('"type":"AGENT_END"');
+  check('ask 段帧序 permission_ask → REQUEST_STOP → AGENT_RESULT → AGENT_END',
+    idxAsk >= 0 && idxAsk < idxStop && idxStop < idxResult && idxResult < idxEnd1,
+    `ask=${idxAsk} stop=${idxStop} result=${idxResult} end=${idxEnd1}`);
+  // 工具帧裸名（AF 契约词表）：模型调限定名，帧面输出裸名
+  const callStart = raw.match(/"type":"TOOL_CALL_START"[^}]*/)?.[0];
+  check('TOOL_CALL_START 帧面为裸名（模型调限定名 mcp__platform-publisher__delete_service）',
+    Boolean(callStart) && callStart.includes('"toolName":"delete_service"') && !callStart.includes('mcp__'),
+    callStart ?? '无 TOOL_CALL_START');
 
   // /confirm-stream 拒绝 → 恢复段 RESULT_END 为 DENIED/ERROR + 工具体未执行
   const sid = raw.match(/"session_id":"([^"]+)"/)?.[1];
@@ -209,6 +222,9 @@ try {
     raw2 += dec2.decode(value, { stream: true });
     if (/"type":"AGENT_END"/.test(raw2) || /"type":"error"/.test(raw2)) break;
   }
+  check('确认续段以 AGENT_START + USER_CONFIRM_RESULT(confirmed:false) 起段',
+    /"type":"AGENT_START"/.test(raw2) && /"type":"USER_CONFIRM_RESULT"[^}]*"confirmed":false/.test(raw2),
+    raw2.slice(0, 200));
   const denyEnd = [...raw2.matchAll(/"type":"TOOL_RESULT_END",([^}]*)\}/g)].map((m) => m[0]).find((f) => f.includes('delete_service') || f.includes(askTcid));
   check('拒绝后恢复流 TOOL_RESULT_END 为 DENIED/ERROR', Boolean(denyEnd) && /DENIED|ERROR/.test(denyEnd), denyEnd ?? '无 TOOL_RESULT_END');
   check('拒绝原因带审批语义（rejected/已拒绝）', raw2.includes('rejected') || raw2.includes('已拒绝'));
