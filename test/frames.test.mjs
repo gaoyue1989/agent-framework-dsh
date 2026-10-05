@@ -194,3 +194,52 @@ test('工具调用完整时序快照：结算 tool/call → 摘要；tool/result
     'tool_result_preview',
   ]);
 });
+
+test('工具帧裸名归一（AF 契约词表）：限定名 mcp__{server}__tool → 裸名（活流 + 结算两路径）', () => {
+  const s = createTurnSerializer({
+    sessionId: 's1',
+    turn: 1,
+    agentName: 'oaf-dsh-agent',
+    displayToolName: (n) => String(n).replace(/^mcp__[^_]+__/, ''),
+  });
+
+  // 活流路径：TOOL_CALL_START/DELTA/END 帧面为裸名
+  const live = [
+    ...liveStreamFrames(s, { type: 'chunk', chunk: { type: 'tool-call-delta', index: 1, id: 'q1', name: 'mcp__platform-publisher__publish_service', argumentsDelta: '{}' } }),
+    ...liveStreamFrames(s, { type: 'chunk', chunk: { type: 'block-end', index: 1, block: { type: 'toolCall' } } }),
+  ];
+  const start = live.find((f) => f.type === 'TOOL_CALL_START');
+  const end = live.find((f) => f.type === 'TOOL_CALL_END');
+  assert.equal(start.toolName, 'publish_service');
+  assert.equal(end.toolCallName, 'publish_service');
+
+  // 结算路径：摘要帧与工具名均裸名（摘要文案不再携带 mcp__ 前缀）
+  const settled = settledEventFrames(s, { type: 'tool/call', seq: 0, time: 0, data: { callId: 'q1', name: 'mcp__platform-publisher__publish_service', arguments: '{}' } });
+  const summary = settled.find((f) => f.type === 'tool_call_summary');
+  assert.equal(summary.toolName, 'publish_service');
+  assert.equal(summary.summary, '执行 publish_service');
+
+  const result = settledEventFrames(s, {
+    type: 'tool/result', seq: 0, time: 0,
+    data: { message: { role: 'tool', toolCallId: 'q1', content: [{ type: 'text', text: '{"ok":true}' }] } },
+  });
+  const resultEnd = result.find((f) => f.type === 'TOOL_RESULT_END');
+  assert.equal(resultEnd.toolCallName, 'publish_service');
+  assert.equal(result.find((f) => f.type === 'tool_result_preview').toolName, 'publish_service');
+});
+
+test('HITL 确认续段 replyId 递增：resumeSeq 置后结算帧挂新 reply（r{turn+n}）', () => {
+  const s = serializer(1);
+  settledEventFrames(s, { type: 'tool/call', seq: 1, time: 0, data: { callId: 'c1', name: 'echo', arguments: '{}' } });
+  // 服务器（oaf-server HITL 桥）在确认后递增 replyId——此处模拟同一状态迁移
+  s.resumeSeq = (s.resumeSeq ?? 0) + 1;
+  s.replyId = `r${s.turn + s.resumeSeq}`;
+  const frames = settledEventFrames(s, {
+    type: 'tool/result', seq: 2, time: 0,
+    data: { message: { role: 'tool', toolCallId: 'c1', content: [{ type: 'text', text: 'ok' }] } },
+  });
+  assert.equal(s.replyId, 'r2');
+  assert.ok(frames.every((f) => f.replyId === 'r2'), '续段帧统一挂新 replyId');
+  const turnEnd = settledEventFrames(s, { type: 'turn/end', seq: 3, time: 0, data: { turn: 1 } });
+  assert.equal(turnEnd[0].replyId, 'r2');
+});

@@ -5,8 +5,8 @@
  * - get_current_time(timezone)：指定时区当前时间
  * - present_file(file_path, file_content_base64?)：工作区产物登记为可下载交付
  *   （file_asset 落库 + `oaf/file-ready` 事件 → oaf-server 合成 file_ready 帧）
- * - present_url(file_name, url, mime_type?, size?)：外部交付物登记（/files/{id} 代理回源，
- *   前缀白名单由 oaf-server 下载侧执行）
+ * - present_url(file_name, url, mime_type?, size?)：外部交付物登记（登记侧执行
+ *   FILE_EXTERNAL_URL_PREFIXES 前缀白名单，下载侧代理回源二次校验）
  *
  * @module @oaf/oaf-tools
  */
@@ -150,7 +150,7 @@ class OafToolsService extends Service {
           file_content_base64: { type: 'string', description: '可选：直接登记的 base64 内容' },
         },
         output: {
-          schema: { type: 'object', additionalProperties: false, properties: { file_id: { type: 'string', required: true }, file_name: { type: 'string', required: true } } },
+          schema: { type: 'object', additionalProperties: false, properties: { file_id: { type: 'string', required: true }, file_name: { type: 'string', required: true }, mime_type: { type: 'string' }, size: { type: 'number' } } },
           render: (args, value) => [{ type: 'text', text: `已登记交付文件 ${value.file_name}（${value.file_id}）` }],
         },
         execute: async (args, exec) => {
@@ -182,12 +182,19 @@ class OafToolsService extends Service {
           size: { type: 'integer', description: '字节数' },
         },
         output: {
-          schema: { type: 'object', additionalProperties: false, properties: { file_id: { type: 'string', required: true }, file_name: { type: 'string', required: true } } },
+          schema: { type: 'object', additionalProperties: false, properties: { file_id: { type: 'string', required: true }, file_name: { type: 'string', required: true }, mime_type: { type: 'string' }, size: { type: 'number' } } },
           render: (args, value) => [{ type: 'text', text: `已登记外部交付 ${value.file_name}（${value.file_id}）` }],
         },
         execute: async (args, exec) => {
-          const url = String(args.url ?? '');
-          if (!/^https?:\/\//.test(url)) throw new Error('present_url 仅接受 http(s) URL');
+          const url = String(args.url ?? '').trim();
+          // 登记侧白名单（AF FileTools.presentUrl 同款语义，issue dsh#2）：
+          // 失败/拒绝路径只回错误结果，不落 file_asset、不发 file-ready 事件
+          const prefixes = (process.env.FILE_EXTERNAL_URL_PREFIXES ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+          if (!prefixes.length) throw new Error('present_url unavailable: no external URL prefixes configured (FILE_EXTERNAL_URL_PREFIXES)');
+          if (!url) throw new Error('url is required');
+          if (!/^https?:\/\//.test(url)) throw new Error(`url must be http(s): ${url}`);
+          const allowed = prefixes.some((p) => url === p || url.startsWith(p + '/'));
+          if (!allowed) throw new Error(`url not in configured external prefixes: ${url}`);
           const asset = await this.presentAsset({
             sessionId: this.currentSessionId(exec),
             userId: exec.agent?.id ?? '',

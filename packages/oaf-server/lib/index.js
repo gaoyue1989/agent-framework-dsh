@@ -281,8 +281,6 @@ class OafServerService extends Service {
     this.fileReadyQueue = new Map();
     /** UI 代理已确认旁路（一次性）：qualified tool name → true（pre-execute 放行一次）。 */
     this.uiProxyBypass = new Set();
-    /** 裸名别名透传的内层放行（loader 注册的别名已在裸名层完成审批）。 */
-    this.rawAliasBypass = new Set();
   }
 
   static defaults() {
@@ -417,6 +415,14 @@ class OafServerService extends Service {
         sessionId,
         turn: event.data.turn,
         agentName: this.loaderAgentName(),
+        // AF 契约帧词表用裸工具名：mcp__{server}__tool → tool（模型可能调限定名或裸名别名）
+        displayToolName: (name) => {
+          for (const s of this.ctx.oafLoader?.mcpServers ?? []) {
+            const prefix = `mcp__${s}__`;
+            if (String(name).startsWith(prefix)) return String(name).slice(prefix.length);
+          }
+          return String(name);
+        },
       });
     }
     const s = rt.turnState;
@@ -610,7 +616,8 @@ class OafServerService extends Service {
     const disposers = [
       // ask 规则：变更类工具经审批接缝（approval/request）挂起
       this.ctx.on('tools/pre-execute', async (exec, next) => {
-        if (this.uiProxyBypass.delete(exec.name) || this.rawAliasBypass.delete(exec.name)) return next();
+        // 裸名别名透传的内层调用：审批已在裸名层完成（oaf-loader rawAliasBypass），放行一次
+        if (this.uiProxyBypass.delete(exec.name) || loader()?.rawAliasBypass?.delete(exec.name)) return next();
         if (!isAskTool(exec.name)) return next();
         return { kind: 'ask', reason: '需要人工确认后执行' };
       }),
@@ -639,15 +646,22 @@ class OafServerService extends Service {
         ).catch(() => {});
         // input 从该 turn 已结算的 tool/call 帧取（前端确认卡重建用）
         const input = await this.lookupToolInput(rt, callId);
-        // permission_ask 帧：持久化 + 广播（api §9.8：带 id 的真实事件帧，客户端 terminal）
-        await this.emitEventFrames(rt, [{
-          type: 'permission_ask',
-          tool_calls: [{ tool_call_id: callId, name: toolName, input }],
-          reply_id: replyId,
-        }], replyId);
-        // 恢复段兜底摘要登记 + 流收口 + 租约让出 + ASKING 态
+        // 恢复段兜底摘要登记 + ASKING 态先置位（subscribe/状态面在此窗口可见挂起）
         rt.turnState?.resumeSummaries.add(callId);
         rt.asking = true;
+        // ask 段帧序（api-thread-spec/frame-mapping 契约 v2，4db16ba+）：
+        // permission_ask → REQUEST_STOP → AGENT_RESULT → AGENT_END（挂起段以 AGENT_END 自然收尾）
+        await this.emitEventFrames(rt, [
+          {
+            type: 'permission_ask',
+            tool_calls: [{ tool_call_id: callId, name: toolName, input }],
+            reply_id: replyId,
+          },
+          { type: 'REQUEST_STOP', replyId },
+          { type: 'AGENT_RESULT', replyId },
+          { type: 'AGENT_END', replyId },
+        ], replyId);
+        // 流收口 + 租约让出（工具执行严格等待 /confirm 恢复）
         for (const w of [...rt.writers]) {
           w.end();
           rt.writers.delete(w);
@@ -662,6 +676,18 @@ class OafServerService extends Service {
         });
         if (decision === 'denied') rt.turnState?.deniedCalls.add(callId);
         rt.asking = false;
+        // 确认续段（AF 契约：新 reply 起段）：AGENT_START → USER_CONFIRM_RESULT（恢复段首个业务事件）
+        const s2 = rt.turnState;
+        let resumeReplyId = replyId;
+        if (s2) {
+          s2.resumeSeq = (s2.resumeSeq ?? 0) + 1;
+          resumeReplyId = `r${s2.turn + s2.resumeSeq}`;
+          s2.replyId = resumeReplyId;
+        }
+        await this.emitEventFrames(rt, [
+          { type: 'AGENT_START', replyId: resumeReplyId, sessionId, name: this.loaderAgentName(), role: 'assistant' },
+          { type: 'USER_CONFIRM_RESULT', replyId: resumeReplyId, confirmed: decision === 'approved' },
+        ], resumeReplyId);
         return decision === 'approved' ? 'allowed-once' : 'rejected';
       }),
     ];
@@ -987,11 +1013,19 @@ class OafServerService extends Service {
     if (!message && fileIds.length === 0) {
       return this.json(res, 400, { error: 'message_or_fileIds_required' });
     }
-    if (body.model && !['', 'system', process.env.LLM_MODEL_ID].includes(body.model)) {
-      return this.json(res, 400, { error: 'unknown_model' });
-    }
     const fresh = !body.sessionId;
     const sessionId = body.sessionId || randomUUID();
+
+    // 协议内拒绝（AF 契约对齐，issue dsh#3）：未知模型不发 session_created、不建会话状态，
+    // SSE 200 建流后以 error 帧回（文本带具体模型名，供前端/评测断言）
+    if (body.model && !['', 'system', process.env.LLM_MODEL_ID].includes(body.model)) {
+      res.writeHead(200, sseHeaders());
+      const writer = new SseWriter(res, (cfg.heartbeatIntervalSeconds ?? 20) * 1000);
+      writer.control(controlFrames.error(`unknown_model: ${body.model}`));
+      writer.end();
+      return;
+    }
+
     const rt = this.runtimeOf(sessionId);
     rt.userId = userId;
 
