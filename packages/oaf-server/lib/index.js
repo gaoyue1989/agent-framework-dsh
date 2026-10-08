@@ -29,6 +29,7 @@ import {
   textOfBlocks,
   summarizeCall,
   previewText,
+  frameUsage,
 } from './frames.js';
 
 export const name = 'oaf-server';
@@ -441,14 +442,13 @@ class OafServerService extends Service {
       const text = textOfBlocks(event.data?.message?.content);
       if (text) rt.lastAssistantText = text;
       // llm-calls 事件化记录（A5：call_id 带 call- 前缀、timestamp 毫秒、USER 大写、usage 三键）
-      const u = event.data?.usage ?? {};
-      const inTok = Number(u.inputTokens ?? 0);
-      const outTok = Number(u.outputTokens ?? 0);
+      // usage 与帧面同口径（全量，含缓存命中；见 frames.js frameUsage）
+      const u = frameUsage(event.data?.usage ?? {});
       this.pool.query(
         'INSERT INTO llm_call (session_id, call_id, model, request_json, response_json, created_ms) VALUES (?, ?, ?, ?, ?, ?)',
         [sessionId, `call-${randomUUID()}`, String(event.data?.message?.source?.provider ?? ''),
          JSON.stringify({ messages: (rt.userMsgBuffer ?? []).map((c) => ({ role: 'USER', content: c })) }),
-         JSON.stringify({ usage: { input_tokens: inTok, output_tokens: outTok, total_tokens: Number(u.totalTokens ?? inTok + outTok) } }),
+         JSON.stringify({ usage: { input_tokens: u.inputTokens, output_tokens: u.outputTokens, total_tokens: u.totalTokens } }),
          Number(event.time ?? Date.now())],
       ).catch(() => {});
     }

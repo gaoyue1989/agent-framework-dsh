@@ -12,6 +12,7 @@ import {
   liveStreamFrames,
   controlFrames,
   textOfBlocks,
+  frameUsage,
 } from '@oaf/oaf-server/frames';
 
 function serializer(turn = 1) {
@@ -117,6 +118,38 @@ test('assistant/message usage → MODEL_CALL_END（AF token 三字段）', () =>
     data: { turn: 1, step: 1, message: { role: 'assistant', content: [] }, usage: { inputTokens: 10, outputTokens: 8, totalTokens: 18 } },
   });
   assert.deepEqual(frames, [{ type: 'MODEL_CALL_END', replyId: 'r1', inputTokens: 10, outputTokens: 8, totalTokens: 18 }]);
+});
+
+test('usage 口径：MODEL_CALL_END.inputTokens 为全量（缓存命中计入，issue #7）', () => {
+  const s = serializer();
+  // dsh 上游口径：inputTokens = 未命中增量，cacheReadTokens 承载命中部分（真实 prompt 6732 = 76 + 6656）
+  const frames = settledEventFrames(s, {
+    type: 'assistant/message', seq: 0, time: 0,
+    data: {
+      turn: 1, step: 1, message: { role: 'assistant', content: [] },
+      usage: { inputTokens: 76, outputTokens: 40, cacheReadTokens: 6656, totalTokens: 6772 },
+    },
+  });
+  assert.deepEqual(frames, [{ type: 'MODEL_CALL_END', replyId: 'r1', inputTokens: 6732, outputTokens: 40, totalTokens: 6772 }]);
+  // 帧内自洽：全量 input + output === totalTokens（修复前 input+output 与 total 互相矛盾）
+  assert.equal(frames[0].inputTokens + frames[0].outputTokens, frames[0].totalTokens);
+});
+
+test('frameUsage：cacheWrite 同样计入 input；缺 totalTokens 时按全量兜底', () => {
+  assert.deepEqual(
+    frameUsage({ inputTokens: 100, outputTokens: 20, cacheReadTokens: 900, cacheWriteTokens: 50, totalTokens: 1070 }),
+    { inputTokens: 1050, outputTokens: 20, totalTokens: 1070 },
+  );
+  // 无 totalTokens：input + output 现由全量 input 推出，不再漏掉缓存部分
+  assert.deepEqual(
+    frameUsage({ inputTokens: 5, outputTokens: 3, cacheReadTokens: 7 }),
+    { inputTokens: 12, outputTokens: 3, totalTokens: 15 },
+  );
+  // 无缓存字段（单轮/未命中 provider）：行为与修复前一致
+  assert.deepEqual(
+    frameUsage({ inputTokens: 10, outputTokens: 8, totalTokens: 18 }),
+    { inputTokens: 10, outputTokens: 8, totalTokens: 18 },
+  );
 });
 
 test('turn/end → AGENT_END；非映射事件（user/message 等）零帧', () => {
