@@ -139,6 +139,33 @@ function displayNameOf(s, name) {
 }
 
 /**
+ * dsh usage → AF 帧面 usage 三字段（全量口径，对齐 OpenAI `prompt_tokens` / AF `ModelCallEndEvent`）。
+ *
+ * dsh 侧的 `inputTokens` 是**缓存未命中增量**：pi-ai 归一化 `input = promptTokens − cacheRead − cacheWrite`
+ * （`@earendil-works/pi-ai` openai-completions 适配层），命中部分落在 `cacheReadTokens`/`cacheWriteTokens`。
+ * 直接上报会让多轮对话的 input 趋近 0（缓存命中率逐轮升高时），下游按 MODEL_CALL_END 做的
+ * token 统计、成本核算与跨运行时对比全部严重低估——故帧面按全量口径还原。
+ *
+ * 注意 `totalTokens` 无需相加：pi-ai 的 `totalTokens = input + output + cacheRead + cacheWrite` 本就是全量，
+ * 直接透传即与「全量 input + output」自洽（修复前二者互相矛盾）。
+ *
+ * @param {{inputTokens?: number, outputTokens?: number, totalTokens?: number,
+ *          cacheReadTokens?: number, cacheWriteTokens?: number}} u dsh `assistant/message` 的 usage
+ * @returns {{inputTokens: number, outputTokens: number, totalTokens: number}} AF 帧面 usage 三字段
+ */
+export function frameUsage(u) {
+  const cacheRead = Number(u.cacheReadTokens ?? 0);
+  const cacheWrite = Number(u.cacheWriteTokens ?? 0);
+  const input = Number(u.inputTokens ?? 0) + cacheRead + cacheWrite;
+  const output = Number(u.outputTokens ?? 0);
+  return {
+    inputTokens: input,
+    outputTokens: output,
+    totalTokens: Number.isFinite(Number(u.totalTokens)) ? Number(u.totalTokens) : input + output,
+  };
+}
+
+/**
  * 结算事件 → AF 帧（0..n 帧）。event 为 dsh `session/event` 的 event（{type, seq, time, data}）。
  * 返回的帧不带 seq/id——由调用方（事件镜像）统一编 seq 并补 data.id。
  */
@@ -160,13 +187,7 @@ export function settledEventFrames(s, event) {
       // usage 随 assistant/message 一起留存（无独立 usage 事件）
       const u = d.usage;
       if (!u) return [];
-      return [{
-        type: 'MODEL_CALL_END',
-        replyId,
-        inputTokens: u.inputTokens ?? 0,
-        outputTokens: u.outputTokens ?? 0,
-        totalTokens: u.totalTokens ?? (u.inputTokens ?? 0) + (u.outputTokens ?? 0),
-      }];
+      return [{ type: 'MODEL_CALL_END', replyId, ...frameUsage(u) }];
     }
     case 'tool/call': {
       s.toolNames.set(d.callId, d.name);
